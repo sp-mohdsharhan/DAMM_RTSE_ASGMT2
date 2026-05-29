@@ -131,6 +131,100 @@ Skeleton's per-camera `waitKey(1)` at 200 Hz costs ~400 ms/s. Our `"Perception"`
 9. **RM-tuned `RTTask(...)` args in `__main__`** — only the numbers change.
 10. **`import random`** added; `time.monotonic()` used in new helpers.
 
+---
+
+## Session 2 — Tuning Log & Robustness Upgrades (post-initial integration)
+
+### What we added on top of the original plan
+
+#### 1. HSV auto-calibration (top-priority robustness)
+- Replaced hand-picked HSV constants with **k-means clustering** (`cv2.kmeans`, k=6) over the first ~3 s of front-cam frames (`CALIB_FRAMES = 90`).
+- Hue buckets (`_HUE_BUCKETS`) map detected clusters to `red / yellow / green / police`.
+- Calibrated ranges written to mutable `_hsv_active`; detectors read from it. Handles red hue wraparound.
+- Eliminates the "guessed HSV" failure mode across sprite sets / lighting.
+
+#### 2. Orb-shape pre-filter (rejects environment / lane markings)
+Added a strict shape gate to `_largest_contour_info` — iterate **all** contours and accept only those matching real orbs:
+
+| Filter | Value | Rejects |
+|---|---|---|
+| `ORB_MIN_AREA_PX` | 60 | tiny dash fragments |
+| `ORB_MAX_AREA_FRAC` | 0.07 | grass strips, sky regions |
+| `ORB_MIN_ASPECT … MAX` | 0.70 … 1.45 | red/white curb stripes |
+| `ORB_MIN_CIRCULARITY` | 0.60 (4πA/P²) | jagged shapes |
+| `ORB_MIN_FILL_RATIO` | 0.65 (area/bbox) | hollow/dashed patterns |
+
+#### 3. Spatial ROI tightening for slopes
+- `FRONT_ROI_TOP_FRAC: 0.40 → 0.28` — keeps headroom for **uphill** orbs that ride above the flat-horizon line.
+- `FRONT_ROI_SIDE_FRAC = 0.15` — crops grass shoulders so calibration & detection both ignore them.
+- `roi_x0` propagated through `_largest_contour_info` → `centroid_x_norm` and overlay drawing stay in global frame coordinates.
+
+#### 4. Committed red-avoidance ("force lane change")
+Red is now **priority #1** with closed-loop enforcement:
+- `RED_AVOID_AREA_FRAC = 0.010` — trigger early (smaller, more distant reds).
+- `RED_AVOID_BAND_FRAC = 0.70` — wider than `CENTER_BAND_FRAC` (0.55); any red roughly ahead fires.
+- `RED_LANE_CHANGE_DURATION_S = 1.6 s` — matches yellow-event lane change; guarantees a full lane cross.
+- **Direction flip** — if a new red appears on the side the car is swerving toward, latch reverses + re-arms.
+- **Settle phase** (`RED_SETTLE_DURATION_S = 0.35 s`, counter-steer `−0.5 × dir`) — straightens the car in the new lane instead of relying solely on lane-follow recovery.
+- Auto re-arm if red is still in view after the sequence completes.
+
+#### 5. Final steering priority (current)
+1. RED avoid (swerve) — `area ≥ 1.0%` AND `|cx| < 0.70`
+2. RED latch hold / direction-flip / settle counter-steer
+3. `force_lane_change` event (from yellow)
+4. YELLOW avoid — `area ≥ 2.0%` AND `|cx| < 0.55`
+5. GREEN attract — `0.5 × cx`, only if `area ≥ 0.5%`
+6. Lane follow — `0.6 × lane_offset`
+7. Default `0`
+
+### Tuning iteration history (distance vs hit counts)
+
+| Iter | Δ | g | r | y | dist (m) |
+|---|---|---|---|---|---|
+| 1 | baseline | 18 | 17 | 9 | — |
+| 2 | red avoid earlier, yellow avoid added, target_speed 50→70 | 26 | 10 | 11 | — |
+| 3 | green attract gain ↑ 0.5→1.2, full-lock pursuit latch | (no lane change in practice) | — | — | — |
+| 4 | revert to "best": green gain 0.5, no green latch | 16 | 11 | 13 | 9022 |
+| 5 | shape filter tightened (fill-ratio, stricter circularity) | 12 | 13 | 11 | — |
+| 6 | ROI top loosened (0.40→0.28) for slopes, red latch direction-flip | — | — | — | 14928 |
+| 7 | red lane-change enforced (1.6 s + 0.35 s settle counter-steer) | pending | pending | pending | pending |
+
+---
+
+## What to try next for further improvement (invariably) — pending list
+
+These are **independent, ranked-by-expected-impact** experiments. Each can be A/B tested in isolation.
+
+### Tier A — high expected impact, low risk
+1. **Adaptive target speed** — currently fixed at 70. Add `if no_red_in_view AND no_yellow_in_view AND lane_clear: target_speed = min(100, target_speed + 1 per second)` so the car coasts faster on empty stretches and slows on cluttered ones.
+2. **Per-color cooldown after avoid** — after a red lane-change completes, suppress green attraction for 0.5 s so the car doesn't immediately get pulled back into the lane it just left.
+3. **Yellow categorization** — currently all yellow events are equal-probability. If we could distinguish "police-spawning yellow" from others, we'd avoid only those. Workaround: lower `YELLOW_AVOID_BAND_FRAC` so we only swerve for dead-center yellows (most yellows can be passed safely).
+4. **Lane-aware swerve direction** — currently we always swerve opposite of red centroid. If the car is already in the leftmost lane and red is on the right, swerving further right is impossible. Track lane index (count crossed lane lines from `detect_lane_offset`) and clamp swerve direction.
+
+### Tier B — perception improvements
+5. **Multi-orb scoring** — `_largest_contour_info` returns only the largest. On approach a closer-but-smaller red can be obscured by a farther-but-larger green; return the **most threatening** orb per color (largest red with `area_frac > AVOID_THRESHOLD` even if a bigger green exists).
+6. **Temporal tracking (IoU across frames)** — current detection is stateless; an orb flickers in/out due to perspective. Track bbox IDs across 3-5 frames to stabilize detection and reject one-frame false positives.
+7. **HoughCircles secondary verification** — for marginal cases (area near threshold), confirm with `cv2.HoughCircles` to fully reject non-circular environment blobs.
+8. **Dynamic horizon detection** — compute the lane-line vanishing point and set `FRONT_ROI_TOP_FRAC` dynamically so slopes are fully handled (current 0.28 is a compromise that includes some sky).
+
+### Tier C — controller improvements
+9. **PID lane follow** (currently P-only). Add a D term to damp oscillation on straights, an I term to handle camera tilt bias.
+10. **Speed-adaptive steering gain** — at higher speeds reduce `RED_AVOID_GAIN` (full-lock at 100 km/h is too aggressive); at low speeds increase it.
+11. **Predictive lookahead** — instead of reacting to the current frame's red, integrate predicted ego-position over the next 1 s and check whether predicted path intersects any red bbox center.
+
+### Tier D — RT / threading
+12. **Move calibration to a one-shot init task** instead of running it inside `processing_task` — frees the processing loop to skip the `if calibrating:` branch every frame.
+13. **Separate front-perception and rear-perception tasks** so a slow rear-frame doesn't block front-frame reaction time. (Bigger refactor — currently both run in one `processing_task`.)
+14. **Use `time.perf_counter()`** for deadline-miss diagnostics; log p99 of each task period. Tune RTTask periods based on measured latency, not guesses.
+
+### Tier E — competition meta
+15. **Telemetry replay** — log `(timestamp, front_bboxes, rear_bboxes, steer, accel, target_speed)` to JSONL; replay tracks offline to A/B test controller changes without re-racing.
+16. **Per-track parameter profiles** — if the competition uses multiple tracks, detect track via background color histogram and load a saved tuning profile.
+
+### Validation criteria
+After each change run **3 laps minimum** and compare `(distance, red_hits, yellow_hits, green_hits)`. A change is kept only if **distance improves AND red_hits do not increase**.
+
+
 ## Relevant Files
 - `sample_drive.py` — only file modified (imports, `shared_data`, new helpers, two task bodies, RTTask args).
 - `requirements.txt` — no edits (`opencv-python`, `numpy` already present).
@@ -166,3 +260,4 @@ ML detectors, disk logging, tuning GUI, edits to Configuration / Scheduling / Ne
 2. **Green attractor strength** — recommend P-gain 0.8 overriding lane until green is hit.
 3. **Red avoid trigger** — only when in center band; else ignored.
 4. **Initial `target_speed`** — 50 default; prefer 70 for faster start?
+

@@ -30,7 +30,7 @@ shared_data = {
     # --- perception/control state (added) ---
     'steering_cmd': 0.0,
     'accel_cmd': 0.0,
-    'target_speed': 50.0,           # 0..100 internal speed model
+    'target_speed': 70.0,           # 0..100 internal speed model
     'police_active': False,         # halves throttle while True
     'active_events': {},            # {event_name: expiry_monotonic_ts}
     'last_hit_ts': {'red': 0.0, 'green': 0.0, 'yellow': 0.0},
@@ -219,16 +219,32 @@ def read_back_camera_task():
 
 # --- Tunable constants -----------------------------------
 PROC_W, PROC_H = 320, 240                # working resolution for perception
-FRONT_ROI_TOP_FRAC = 0.40                # ignore top 40% of front frame
+FRONT_ROI_TOP_FRAC = 0.28                # ignore top 28%: keep horizon margin for uphill/downhill slopes
+FRONT_ROI_SIDE_FRAC = 0.15               # ignore leftmost/rightmost 15% (grass shoulders)
+# Orb-shape filters (reject grass strips, road markings, curb dashes, etc.)
+ORB_MAX_AREA_FRAC = 0.07                 # anything larger than this is environment
+ORB_MIN_AREA_PX = 60                     # smallest detectable orb (raised: reject small dashes)
+ORB_MIN_ASPECT = 0.70                    # near-square only (rejects dash rectangles)
+ORB_MAX_ASPECT = 1.45
+ORB_MIN_CIRCULARITY = 0.60               # 4*pi*A/P^2 — true orbs ~0.75+, dashes <0.5
+ORB_MIN_FILL_RATIO = 0.65                # area / bbox_area; circles fill ~0.78, dashes <0.5
 HIT_AREA_FRAC = 0.06                     # bbox/ROI area to count as "hit"
-RED_AVOID_AREA_FRAC = 0.04               # bbox/ROI area to trigger avoid
-CENTER_BAND_FRAC = 0.30                  # |x_norm| < this counts as "in path"
+RED_AVOID_AREA_FRAC = 0.010              # detect red even further away (commit lane change early)
+RED_AVOID_BAND_FRAC = 0.70               # wider than CENTER_BAND_FRAC: any red roughly ahead triggers lane change
+RED_LANE_CHANGE_DURATION_S = 1.6         # matches LANE_CHANGE_DURATION_S — guaranteed full lane cross
+RED_SETTLE_DURATION_S = 0.35             # brief counter-steer to straighten out after the swerve
+YELLOW_AVOID_AREA_FRAC = 0.02            # bbox/ROI area to trigger yellow avoidance
+CENTER_BAND_FRAC = 0.55                  # |x_norm| < this counts as "in path"
 COOLDOWN_S = 1.0                         # per-color hit cooldown
 EVENT_DURATION_S = 5.0                   # cam-degrade & most yellow events
 LANE_CHANGE_DURATION_S = 1.5
 LANE_CHANGE_STEER = 0.8
-GREEN_ATTRACT_GAIN = 0.8
-RED_AVOID_GAIN = 0.9
+GREEN_ATTRACT_GAIN = 0.5                 # gentle pull toward green; don't get dragged into reds
+GREEN_ATTRACT_MIN_AREA = 0.005           # ignore tiny far-away greens (false attractors)
+GREEN_PURSUE_OFFSET = 0.15               # |x_norm| above this -> full lock + latch
+GREEN_PURSUE_DURATION_S = 0.6            # commit to lane change for this long
+RED_AVOID_GAIN = 1.0                     # full-lock swerve when red is in path
+YELLOW_AVOID_GAIN = 0.9
 LANE_GAIN = 0.6
 POLICE_THROTTLE_MULT = 0.5
 
@@ -236,11 +252,45 @@ CAM_BASE_PERIOD = 0.005                  # 200 Hz nominal
 CAM_DEGRADED_PERIOD = 0.100              # 10 Hz while degraded
 
 # HSV ranges (OpenCV uses H:0-179, S:0-255, V:0-255)
+# These are *defaults*. Auto-calibration (see _calibrate_step) may overwrite
+# `_hsv_active` at runtime based on what's actually visible in the front view.
 HSV_RED_1 = (np.array([0, 120, 80]),   np.array([10, 255, 255]))
 HSV_RED_2 = (np.array([170, 120, 80]), np.array([179, 255, 255]))
 HSV_GREEN = (np.array([40, 80, 60]),   np.array([85, 255, 255]))
 HSV_YELLOW = (np.array([20, 120, 120]), np.array([35, 255, 255]))
 HSV_POLICE_BLUE = (np.array([100, 120, 60]), np.array([130, 255, 255]))
+
+# Mutable active HSV ranges (list-of-(lo,hi) tuples per color) consulted by detectors.
+# Initially the hardcoded defaults; auto-calibration replaces entries it learns.
+_hsv_active = {
+    'red':    [HSV_RED_1, HSV_RED_2],
+    'green':  [HSV_GREEN],
+    'yellow': [HSV_YELLOW],
+    'police': [HSV_POLICE_BLUE],
+}
+
+# --- HSV auto-calibration (fully autonomous, no user input) -----
+# Runs during the first CALIB_FRAMES processing cycles. Each frame, k-means
+# clusters dominant saturated colors in the front ROI, buckets cluster centers
+# by hue into red/green/yellow/police, and finally rewrites `_hsv_active` with
+# (mean +/- HSV_MARGIN) ranges. Buckets that never accumulate samples retain
+# their hardcoded defaults.
+CALIB_FRAMES = 90                                  # ~3s at 30Hz
+CALIB_KMEANS_K = 6
+CALIB_MIN_PIXELS = 200
+CALIB_SUBSAMPLE = 5000
+HSV_MARGIN = np.array([10, 60, 60], dtype=np.int16)
+_HUE_BUCKETS = [
+    ('red',    [(0, 12), (168, 179)]),
+    ('yellow', [(18, 36)]),
+    ('green',  [(38, 88)]),
+    ('police', [(95, 135)]),
+]
+_calib_state = {
+    'frames_seen': 0,
+    'samples': {'red': [], 'green': [], 'yellow': [], 'police': []},
+    'done': False,
+}
 
 YELLOW_EVENTS = [
     'front_cam_degraded',
@@ -260,39 +310,71 @@ def _color_mask(hsv, *ranges):
         mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, np.ones((3, 3), np.uint8))
     return mask
 
-def _largest_contour_info(mask, roi_area):
+def _largest_contour_info(mask, roi_area, roi_x0=0):
+    """Return the largest orb-shaped contour, or None.
+    Filters out grass strips / road markings via aspect ratio, circularity, and max-area cap.
+    roi_x0 is added to bbox x and centroid for correct global coords when ROI is horizontally cropped.
+    """
     if mask is None:
         return None
     contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
     if not contours:
         return None
-    c = max(contours, key=cv2.contourArea)
-    area = cv2.contourArea(c)
-    if area < 50:
+    best = None
+    best_area = 0.0
+    for c in contours:
+        area = cv2.contourArea(c)
+        if area < ORB_MIN_AREA_PX:
+            continue
+        area_frac = float(area) / float(roi_area)
+        if area_frac > ORB_MAX_AREA_FRAC:
+            continue                                  # too big -> environment
+        x, y, w, h = cv2.boundingRect(c)
+        if h == 0:
+            continue
+        aspect = w / float(h)
+        if aspect < ORB_MIN_ASPECT or aspect > ORB_MAX_ASPECT:
+            continue                                  # too elongated -> grass strip
+        perim = cv2.arcLength(c, True)
+        if perim <= 0:
+            continue
+        circularity = 4.0 * np.pi * area / (perim * perim)
+        if circularity < ORB_MIN_CIRCULARITY:
+            continue                                  # not blob-like
+        bbox_area = float(w * h)
+        if bbox_area <= 0 or (area / bbox_area) < ORB_MIN_FILL_RATIO:
+            continue                                  # sparse/hollow shape (dashed stripe pattern)
+        if area > best_area:
+            best = (c, area, area_frac, x, y, w, h)
+            best_area = area
+    if best is None:
         return None
-    x, y, w, h = cv2.boundingRect(c)
-    cx = x + w / 2.0
+    _, area, area_frac, x, y, w, h = best
+    cx = x + w / 2.0 + roi_x0
     cy = y + h / 2.0
     return {
-        'bbox': (int(x), int(y), int(w), int(h)),
-        'area_frac': float(area) / float(roi_area),
+        'bbox': (int(x + roi_x0), int(y), int(w), int(h)),
+        'area_frac': area_frac,
         'centroid_x_norm': (cx - PROC_W / 2.0) / (PROC_W / 2.0),  # -1..+1
         'centroid_y': float(cy),
     }
 
 def detect_front_objects(frame):
-    """Return dict {'red'|'green'|'yellow': info or None, 'roi_y0': int}."""
+    """Return dict {'red'|'green'|'yellow': info or None, 'roi_y0': int, 'roi_x0': int}."""
     small = cv2.resize(frame, (PROC_W, PROC_H))
     roi_y0 = int(PROC_H * FRONT_ROI_TOP_FRAC)
-    roi = small[roi_y0:, :]
+    roi_x0 = int(PROC_W * FRONT_ROI_SIDE_FRAC)
+    roi_x1 = PROC_W - roi_x0
+    roi = small[roi_y0:, roi_x0:roi_x1]
     roi_area = roi.shape[0] * roi.shape[1]
     hsv = cv2.cvtColor(roi, cv2.COLOR_BGR2HSV)
     return {
         'frame': small,
         'roi_y0': roi_y0,
-        'red':    _largest_contour_info(_color_mask(hsv, HSV_RED_1, HSV_RED_2), roi_area),
-        'green':  _largest_contour_info(_color_mask(hsv, HSV_GREEN), roi_area),
-        'yellow': _largest_contour_info(_color_mask(hsv, HSV_YELLOW), roi_area),
+        'roi_x0': roi_x0,
+        'red':    _largest_contour_info(_color_mask(hsv, *_hsv_active['red']), roi_area, roi_x0),
+        'green':  _largest_contour_info(_color_mask(hsv, *_hsv_active['green']), roi_area, roi_x0),
+        'yellow': _largest_contour_info(_color_mask(hsv, *_hsv_active['yellow']), roi_area, roi_x0),
     }
 
 _prev_other_area = 0.0
@@ -304,7 +386,7 @@ def detect_rear(frame):
     roi_area = PROC_W * PROC_H
     hsv = cv2.cvtColor(small, cv2.COLOR_BGR2HSV)
 
-    police_info = _largest_contour_info(_color_mask(hsv, HSV_POLICE_BLUE), roi_area)
+    police_info = _largest_contour_info(_color_mask(hsv, *_hsv_active['police']), roi_area)
     police_present = police_info is not None and police_info['area_frac'] > 0.01
 
     # Other car: high-saturation contour that is NOT police-blue.
@@ -312,7 +394,7 @@ def detect_rear(frame):
     val = hsv[:, :, 2]
     veh_mask = cv2.inRange(sat, 80, 255)
     veh_mask = cv2.bitwise_and(veh_mask, cv2.inRange(val, 40, 255))
-    police_mask = _color_mask(hsv, HSV_POLICE_BLUE)
+    police_mask = _color_mask(hsv, *_hsv_active['police'])
     if police_mask is not None:
         veh_mask = cv2.bitwise_and(veh_mask, cv2.bitwise_not(police_mask))
     veh_mask = cv2.morphologyEx(veh_mask, cv2.MORPH_OPEN, np.ones((5, 5), np.uint8))
@@ -378,7 +460,8 @@ def draw_overlay(front_per, rear_per, lane_offset, hud):
 
     if front_per:
         y0 = front_per['roi_y0']
-        cv2.rectangle(front_img, (0, y0), (PROC_W - 1, PROC_H - 1), (80, 80, 80), 1)
+        x0 = front_per.get('roi_x0', 0)
+        cv2.rectangle(front_img, (x0, y0), (PROC_W - 1 - x0, PROC_H - 1), (80, 80, 80), 1)
         _draw_obj(front_img, front_per['red'],    "RED",    (0, 0, 255), y0)
         _draw_obj(front_img, front_per['green'],  "GREEN",  (0, 255, 0), y0)
         _draw_obj(front_img, front_per['yellow'], "YELLOW", (0, 255, 255), y0)
@@ -460,6 +543,73 @@ def _expire_events(now):
         elif k == 'back_cam_degraded':
             _cam_degraded['back'] = False
 
+def _bucket_for_hue(h):
+    for name, ranges in _HUE_BUCKETS:
+        for lo, hi in ranges:
+            if lo <= h <= hi:
+                return name
+    return None
+
+def _calibrate_step(frame):
+    """Sample dominant colored clusters via k-means; update _calib_state.
+    Fully autonomous - no human input. Runs only until CALIB_FRAMES is reached."""
+    if _calib_state['done'] or frame is None:
+        return
+    small = cv2.resize(frame, (PROC_W, PROC_H))
+    roi = small[int(PROC_H * FRONT_ROI_TOP_FRAC):, :]
+    hsv = cv2.cvtColor(roi, cv2.COLOR_BGR2HSV)
+    # Keep only saturated, bright pixels (ignore road/sky/dark)
+    mask = (hsv[:, :, 1] > 80) & (hsv[:, :, 2] > 60)
+    pixels = hsv[mask]
+    _calib_state['frames_seen'] += 1
+    if len(pixels) >= CALIB_MIN_PIXELS:
+        samples = pixels.astype(np.float32)
+        if len(samples) > CALIB_SUBSAMPLE:
+            idx = np.random.choice(len(samples), CALIB_SUBSAMPLE, replace=False)
+            samples = samples[idx]
+        criteria = (cv2.TERM_CRITERIA_EPS + cv2.TERM_CRITERIA_MAX_ITER, 10, 1.0)
+        try:
+            _, _, centers = cv2.kmeans(samples, CALIB_KMEANS_K, None,
+                                       criteria, 3, cv2.KMEANS_RANDOM_CENTERS)
+        except cv2.error:
+            centers = []
+        for c in centers:
+            h, s, v = float(c[0]), float(c[1]), float(c[2])
+            if s < 80 or v < 60:
+                continue
+            name = _bucket_for_hue(h)
+            if name is not None:
+                _calib_state['samples'][name].append(c)
+    if _calib_state['frames_seen'] >= CALIB_FRAMES:
+        _finalize_calibration()
+
+def _finalize_calibration():
+    """Convert accumulated cluster centers into HSV ranges and update _hsv_active."""
+    updated = []
+    for name, samples in _calib_state['samples'].items():
+        if not samples:
+            continue
+        arr = np.array(samples, dtype=np.float32)
+        mean = arr.mean(axis=0)
+        lo = np.clip(mean.astype(np.int16) - HSV_MARGIN, [0, 0, 0], [179, 255, 255]).astype(np.uint8)
+        hi = np.clip(mean.astype(np.int16) + HSV_MARGIN, [0, 0, 0], [179, 255, 255]).astype(np.uint8)
+        if name == 'red' and (mean[0] < 15 or mean[0] > 165):
+            # Hue wraparound for red: split into two sub-ranges
+            _hsv_active['red'] = [
+                (np.array([0, lo[1], lo[2]], np.uint8),
+                 np.array([min(15, int(hi[0])), hi[1], hi[2]], np.uint8)),
+                (np.array([max(165, int(lo[0])), lo[1], lo[2]], np.uint8),
+                 np.array([179, hi[1], hi[2]], np.uint8)),
+            ]
+        else:
+            _hsv_active[name] = [(lo, hi)]
+        updated.append(name)
+    _calib_state['done'] = True
+    if updated:
+        print(f"[HSV Calib] Auto-calibrated colors: {updated}. Others kept defaults.")
+    else:
+        print("[HSV Calib] No dominant colors found; keeping all defaults.")
+
 # --- Gated camera reads (yellow-event productivity reduction) -----
 def gated_read_front():
     now = time.monotonic()
@@ -478,23 +628,51 @@ def gated_read_back():
     read_back_camera_task()
 
 # --- Controller ------------------------------------------
+# Red avoidance latch: once a red is detected ahead, commit to a full
+# lane-change away from it for RED_LANE_CHANGE_DURATION_S, then a brief
+# counter-steer settle phase to straighten out in the new lane.
+_red_avoid = {'until': 0.0, 'settle_until': 0.0, 'dir': 0}
+
 def _compute_steering(front_per, lane_offset, force_lane_change, swerve_dir):
-    # 1) Forced lane change overrides everything
-    if force_lane_change:
-        return LANE_CHANGE_STEER * swerve_dir
-    # 2) Red avoidance if centered & close
+    now = time.monotonic()
+    # 1) TOP PRIORITY: Red avoidance — commit to a lane change away from any red ahead.
     red = front_per['red'] if front_per else None
     if red is not None and red['area_frac'] > RED_AVOID_AREA_FRAC \
-            and abs(red['centroid_x_norm']) < CENTER_BAND_FRAC:
-        return float(np.clip(-RED_AVOID_GAIN * np.sign(red['centroid_x_norm'] or 1.0), -1, 1))
-    # 3) Green attraction if visible
+            and abs(red['centroid_x_norm']) < RED_AVOID_BAND_FRAC:
+        direction = -1 if red['centroid_x_norm'] >= 0 else 1
+        _red_avoid['until'] = now + RED_LANE_CHANGE_DURATION_S
+        _red_avoid['settle_until'] = _red_avoid['until'] + RED_SETTLE_DURATION_S
+        _red_avoid['dir'] = direction
+        return float(RED_AVOID_GAIN * direction)
+    # 1b) Red-avoid latch (swerve phase): hold the lane change.
+    #     If a new red appears on the side we're swerving toward, flip direction.
+    if now < _red_avoid['until']:
+        if red is not None and red['area_frac'] > RED_AVOID_AREA_FRAC:
+            red_side = 1 if red['centroid_x_norm'] >= 0 else -1
+            if red_side == _red_avoid['dir']:
+                _red_avoid['dir'] = -_red_avoid['dir']
+                _red_avoid['until'] = now + RED_LANE_CHANGE_DURATION_S
+                _red_avoid['settle_until'] = _red_avoid['until'] + RED_SETTLE_DURATION_S
+        return float(RED_AVOID_GAIN * _red_avoid['dir'])
+    # 1c) Settle phase: brief counter-steer to straighten out (close the loop on the lane change).
+    if now < _red_avoid['settle_until']:
+        return float(-0.5 * _red_avoid['dir'])
+    # 2) Forced lane change (from yellow event)
+    if force_lane_change:
+        return LANE_CHANGE_STEER * swerve_dir
+    # 3) Yellow avoidance if in lane band & close (police/cam-degrade risk too high)
+    yellow = front_per['yellow'] if front_per else None
+    if yellow is not None and yellow['area_frac'] > YELLOW_AVOID_AREA_FRAC \
+            and abs(yellow['centroid_x_norm']) < CENTER_BAND_FRAC:
+        return float(np.clip(-YELLOW_AVOID_GAIN * np.sign(yellow['centroid_x_norm'] or 1.0), -1, 1))
+    # 4) Green attraction (gentle)
     green = front_per['green'] if front_per else None
-    if green is not None:
+    if green is not None and green['area_frac'] > GREEN_ATTRACT_MIN_AREA:
         return float(np.clip(GREEN_ATTRACT_GAIN * green['centroid_x_norm'], -1, 1))
-    # 4) Lane following
+    # 5) Lane following
     if lane_offset is not None:
         return float(np.clip(LANE_GAIN * lane_offset, -1, 1))
-    # 5) Default
+    # 6) Default
     return 0.0
 
 def processing_task():
@@ -505,6 +683,10 @@ def processing_task():
 
     if front_frame is None and back_frame is None:
         return
+
+    # Autonomous HSV calibration (warm-up only)
+    if not _calib_state['done'] and front_frame is not None:
+        _calibrate_step(front_frame)
 
     # Perception (lock-free)
     front_per = detect_front_objects(front_frame) if front_frame is not None else None
@@ -609,8 +791,11 @@ if __name__ == '__main__':
     # NOTE: cameras use gated wrappers so yellow events can degrade their effective rate
     # without mutating RTTask.period. Periods chosen Rate-Monotonic compliant:
     # shorter period -> higher priority (cameras 5ms HIGH > controls 20ms HIGH > processing 33ms MEDIUM).
+    # Processing kept at MEDIUM (not LOW): it is the brain that converts perception
+    # into steering/accel. At LOW it could be starved under CPU contention, causing
+    # SendControls (HIGH) to repeatedly resend stale commands -> car drives blind.
     t_front_camera = RTTask("ReadFrontCamera", period=0.005, priority=TaskPriority.HIGH, execute_func=gated_read_front)
-    t_back_camera = RTTask("ReadBackCamera", period=0.005, priority=TaskPriority.HIGH, execute_func=gated_read_back)
+    t_back_camera = RTTask("ReadBackCamera", period=0.005, priority=TaskPriority.LOW, execute_func=gated_read_back)
     t_processing = RTTask("Processing", period=0.033, priority=TaskPriority.MEDIUM, execute_func=processing_task)
     t_controls = RTTask("SendControls", period=0.020, priority=TaskPriority.HIGH, execute_func=send_controls_task)
     

@@ -21,57 +21,72 @@
 This project implements an **autonomous driving controller** for the **SpeedTrials2D** competition game, built around the four pillars of real-time software engineering:
 
 1. **Concurrency** — multiple cooperating threads (camera readers, perception, control sender)
-2. **Task Periods** — deterministic execution rates per task (Rate-Monotonic compliant)
-3. **Task Priorities** — Windows thread priorities tuned to deadline criticality
+2. **Task Periods** — deterministic execution rates per task (each period set to its deadline)
+3. **Task Priorities** — Windows thread priorities tuned to deadline criticality (Deadline-Monotonic)
 4. **Shared-Resource Synchronisation** — split locks (`data_lock` for frames, `state_lock` for control state) to avoid priority inversion
 
 The car perceives the world through **two virtual cameras** (front + rear) streamed over TCP, runs an OpenCV vision pipeline, and sends `(steering, acceleration)` commands back to the simulator at 50 Hz.
 
+Per the official poster (`game rule/RTSE_Poster_game.pdf`), the **Unity simulator is the authoritative state machine** — it owns score, speed, and event resolution. Our controller therefore keeps no shadow simulation; it reacts to what the cameras show, frame by frame.
+
 ---
 
-## Game Rules Implemented
+## Game Rules (per poster)
 
-**Front camera — coloured orbs**
+**Tokens (front-camera observations)**
 
-| Colour | Effect on hit | Steering role |
+| Colour | Game effect | Our steering reaction |
 | --- | --- | --- |
-| Red | `target_speed −= 20` | **Avoid** — hard lane-change away |
-| Green | `target_speed += 10` | **Attract** — steer toward (score booster) |
-| Yellow | Random event (1 of 5) | Avoid only if dead-centre |
+| Green | +10 % speed | **Attract** — gentle P-controller toward centroid |
+| Red | −20 % speed | **Avoid** — hard lane-change away (inverted to **seek** in police mode) |
+| Yellow | Random 1-of-5 corruption (next token hidden, tokens invisible 5 s, camera input delay 5 s, action output delay 5 s, corrupted camera input 5 s) | Avoid only if dead-centre — most yellow effects are temporary input corruption, not catastrophic |
 
-**Yellow event pool:** front-cam degrade, back-cam degrade, `target_speed *= 0.95`, forced lane-change, **spawn police**.
+**Events (poster-listed, all observed directly from camera)**
 
-**Rear camera — two threats**
-- **Police (blue)** — `eff_speed *= 0.5` while present; cleared only by hitting the next front orb.
-- **Other car** — growing rear contour triggers a forced lane-change (rear cars are 10 % faster, so we yield).
+| Event | Signal | Reaction |
+| --- | --- | --- |
+| **Trailing car** | Growing high-saturation contour in rear cam | 1.5 s defensive swerve, direction alternates each trigger |
+| **Police** | Blue contour in rear cam | Flip red behaviour to **seek the next red token** (poster: "catch next red or −50 % speed") |
+| **Low brightness** | Mean V channel of front frame falls below threshold | Reduce throttle (`0.8 → 0.4`) — token visibility is degraded |
+
+Our software does **not** track score, speed, hit cooldowns, or yellow-event outcomes — those are the game's job.
 
 ---
 
 ## Real-Time Architecture
 
-### Tasks (Rate-Monotonic schedule)
+### Tasks (Deadline-Monotonic schedule)
 
 | Task | Period | Priority | Role |
 | --- | --- | --- | --- |
-| `ReadFrontCamera` | 5 ms | HIGH | TCP frame decode (gated to match degrade events) |
-| `ReadBackCamera` | 5 ms | HIGH | TCP frame decode (gated) |
-| `Processing` | 33 ms | MEDIUM | OpenCV perception + steering decision (~30 Hz) |
-| `SendControls` | 20 ms | HIGH | Non-blocking send of `(steering, accel)` (50 Hz) |
+| `ReadFrontCamera` | 5 ms | HIGH | TCP frame decode — collision-critical input |
+| `SendControls` | 20 ms | HIGH | Non-blocking send of `(steering, accel)` (50 Hz) — hard actuator deadline |
+| `Processing` | 33 ms | MEDIUM | OpenCV perception + steering decision (~30 Hz) — the "brain" |
+| `ReadBackCamera` | 50 ms | LOW | TCP frame decode; rear threats (police / trailing car) evolve slowly |
 
-Shorter-period tasks get higher priority → **RM-correct**.
+Priority tracks **deadline criticality**, not raw period (Deadline-Monotonic). The rear
+camera runs at 20 Hz so its `LOW` priority is the *longest-deadline* task — keeping the
+schedule coherent (longest deadline → lowest priority) and avoiding priority inversion on
+`data_lock` against the `HIGH` front camera. Camera reads call the skeleton's
+`read_*_camera_task` directly — input corruption / delay is the game's responsibility,
+so we do not throttle our own reads on top of it.
 
 ### Steering Priority Stack (highest wins)
-1. **Red avoid swerve** — early-trigger (`area ≥ 1.0 %`, wide band 70 %), 1.6 s commit + 0.35 s counter-steer settle, direction-flip if re-threatened
-2. **Force-lane-change** event (yellow-spawned)
-3. **Yellow avoid** — only if centred (`area ≥ 2.0 %`, band 55 %)
-4. **Green attract** — P-controller on centroid offset
-5. **Lane follow** — Canny + HoughLinesP on bottom ROI
-6. Default `0.0`
+1. **Police-seek** — if rear cam sees blue **and** front cam has a red, steer toward the red (poster: "catch next red or −50 % speed")
+2. **Red avoid swerve** — early-trigger (`area ≥ 1.0 %`, wide band 70 %), 1.6 s commit + 0.35 s counter-steer settle, direction-flip if re-threatened
+3. **Trailing-car forced swerve** — single timer armed when rear cam shows a growing high-saturation contour; alternates direction each trigger
+4. **Yellow avoid** — only if centred (`area ≥ 2.0 %`, band 55 %)
+5. **Green attract** — P-controller on centroid offset
+6. **Lane follow** — Canny + HoughLinesP on bottom ROI
+7. Default `0.0`
 
-### Perception Pipeline
+Throttle is a one-line policy: `LOW_BRIGHTNESS_THROTTLE (0.4)` if the front frame is dim, otherwise `CRUISE_THROTTLE (0.8)`.
+
+### Perception Pipeline (`image_detection.py`)
 - **HSV auto-calibration** via k-means clustering over the first ~3 s of front-cam frames (no hand-tuned colour constants)
 - **Orb shape gate** — area / aspect-ratio / circularity (`4πA/P² ≥ 0.60`) / fill-ratio (`≥ 0.65`) filters reject lane markings, grass, sky
 - **ROI tightening** — top `0.28`, sides `0.15` to handle uphill orbs while ignoring shoulders
+- **Low-brightness detector** — mean V channel on a centre crop (HUD-bias-free)
 - **Frame-snapshot pattern** — `processing_task` grabs frame refs under `data_lock`, releases, then runs the ~10–20 ms CV pipeline lock-free
 
 ---
@@ -81,12 +96,16 @@ Shorter-period tasks get higher priority → **RM-correct**.
 ```
 DAMM_RTSE_ASGMT2/
 ├── README.md                — this file
-├── plan.md                  — full design plan + tuning iteration log
+├── plan.md                  — design plan + tuning iteration log (historical, see Phase 3 postscript)
+├── imagedetection.md        — perception improvement backlog (grounded in screenshot/)
 ├── requirements.txt         — opencv-python, numpy, keyboard
-├── sample_drive.py          — main controller (editable + locked sections)
+├── sample_drive.py          — controller + RT scheduling (editable + locked sections)
+├── image_detection.py       — OpenCV perception module (HSV calib, contour filters, lane, brightness, overlay)
 ├── test_communication.py    — WASD manual-control reference client
 ├── SpeedTrials2D/           — Unity build of the competition game
 │   └── SpeedTrials2D.exe
+├── game rule/
+│   └── RTSE_Poster_game.pdf — official rules poster (authoritative spec)
 └── screenshot/              — runtime captures of the Perception HUD
 ```
 
@@ -110,8 +129,10 @@ python sample_drive.py
 A `Perception` window opens showing the front/rear view, detected orbs, lane lines, and a HUD line:
 
 ```
-target=70 eff=70 police=0 events=[] str=0.00 acc=0.50
+target=80 eff=80 police=0 events=[] str=0.00 acc=0.80
 ```
+
+`target` / `eff` are the chosen throttle × 100 (`CRUISE_THROTTLE = 0.8`, dropping to `0.4` under low brightness). `events` lists what perception is currently reacting to: `TRAILING_CAR`, `POLICE`, `LOW_LIGHT`.
 
 Press `Ctrl+C` in the terminal to shut down cleanly.
 
@@ -137,19 +158,20 @@ Per the assignment skeleton, the following sections of `sample_drive.py` are **l
 - `__main__` shutdown block
 
 Our work lives in the **editable** regions:
-- `shared_data` key extensions
-- New constants, perception helpers, and event-engine functions
-- Bodies of `processing_task` and `send_controls_task`
+- `shared_data` key extensions (kept minimal — just frame slots + control commands + perception snapshots)
+- New module `image_detection.py` containing all perception
+- Body of `processing_task` and `send_controls_task` in `sample_drive.py`
 - Period / priority arguments inside `RTTask(...)` constructors
 
 ---
 
 ## Key Engineering Decisions
 
-- **Split locks** — `data_lock` scoped to frame slots only; `state_lock` protects command/event state. Camera threads never block on control state.
-- **Gated reads instead of mutable periods** — `RTTask.period` is fixed after construction, so cam-degrade yellow events are implemented by early-returning from the read function until the degraded period elapses.
+- **Pure-perception model** — no shadow simulation of game state (no software-tracked score, speed, cooldowns, or yellow-event outcomes). The Unity game is authoritative; the controller only reacts to what cameras show this frame. Removed the previous event-engine layer (~80 lines) once the official poster confirmed this is the intended model.
+- **Perception in its own module** — `image_detection.py` owns HSV calibration, contour shape filters, lane offset, brightness check, and overlay rendering, so the controller stays focused on RT concerns.
+- **Split locks** — `data_lock` scoped to frame slots only; `state_lock` protects command writes. Camera threads never block on control state.
 - **Non-blocking control fallback** — `send_controls_task` uses `state_lock.acquire(blocking=False)`; if busy, it re-sends the last `(steering, accel)`. Classic RT priority-inversion mitigation that keeps the 50 Hz deadline solid.
-- **Monotonic clocks** — `time.monotonic()` everywhere in our cooldown / expiry logic (skeleton's `time.time()` left untouched).
+- **Monotonic clocks** — `time.monotonic()` for the trailing-car swerve timer and red-avoid latch (skeleton's `time.time()` left untouched).
 - **One perception window at 30 Hz** instead of the skeleton's per-camera `imshow` at 200 Hz — cuts `cv2.waitKey` overhead from ~400 ms/s to ~30 ms/s.
 
-See [`plan.md`](./plan.md) for the full design rationale, tuning iteration log, and pending improvement backlog.
+See [`plan.md`](./plan.md) for design history (note: phases 1–2 describe the previous shadow-state design — superseded by the Phase 3 postscript), and [`imagedetection.md`](./imagedetection.md) for the perception improvement backlog grounded in `screenshot/`.

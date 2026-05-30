@@ -1,5 +1,15 @@
 # Plan: OpenCV Auto-Detection for SpeedTrials2D (RTSE Competition)
 
+> **⚠ Status (Phase 3, current):** the shadow-state event engine described in Phases 1–2
+> below has been **removed**. The official rules poster (`game rule/RTSE_Poster_game.pdf`)
+> confirms the Unity simulator is the authoritative state machine, so the controller now
+> reacts purely to per-frame camera observations and keeps no parallel game-rule
+> simulation. Sections in this plan that describe `_apply_color_hit`,
+> `_trigger_yellow_event`, `_expire_events`, gated camera reads, `target_speed`,
+> `active_events`, and the "Yellow event pool" are **historical** and no longer reflect
+> the code. See the **Phase 3 postscript** at the bottom of this file, and
+> `README.md` / `imagedetection.md` for the current architecture.
+
 Integrate OpenCV perception + autonomous control inside the **editable** regions of `sample_drive.py`. Front camera handles color-object detection + lane following with green-attractor steering; back camera detects police (debuff source) and other cars (lane-change trigger).
 
 ## Locked vs Editable (from skeleton comments)
@@ -91,15 +101,22 @@ Integrate OpenCV perception + autonomous control inside the **editable** regions
 
 The skeleton uses identical 5 ms periods and mostly HIGH priorities — wasteful and risks priority inversion / lock contention.
 
-### A. Period & priority retuning (Rate-Monotonic compliant)
+### A. Period & priority retuning (Deadline-Monotonic Scheduling)
 | Task | Skeleton | Proposed | Rationale |
 |---|---|---|---|
-| `ReadFrontCamera` | 5 ms / HIGH | **5 ms / HIGH** (gated) | Tight loop drains backlog; gating handles yellow degrade |
-| `ReadBackCamera` | 5 ms / HIGH | **5 ms / HIGH** (gated) | Same |
-| `Processing` | 5 ms / MEDIUM | **33 ms / MEDIUM** | CV at 200 Hz is waste; 30 Hz matches camera FPS |
-| `SendControls` | 5 ms / HIGH | **20 ms / HIGH** | 50 Hz is enough; cuts socket syscalls |
+| `ReadFrontCamera` | 5 ms / HIGH | **5 ms / HIGH** (gated) | Collision-critical input; tight loop drains backlog; gating handles yellow degrade |
+| `SendControls` | 5 ms / HIGH | **20 ms / HIGH** | Hard 50 Hz actuator deadline; 50 Hz is enough and cuts socket syscalls |
+| `Processing` | 5 ms / MEDIUM | **33 ms / MEDIUM** | The "brain"; CV at 200 Hz is waste; 30 Hz matches camera FPS; kept above rear cam so it is never starved |
+| `ReadBackCamera` | 5 ms / HIGH | **50 ms / LOW** | Rear threats (police / trailing car) evolve slowly: longest deadline → lowest priority |
 
-Shorter period ⇒ higher priority → RM-correct.
+**Why DMS, not pure RM:** `SendControls` has a longer period than the cameras yet a hard
+output deadline, so deadline-criticality — not raw period — drives priority. The rear camera
+was the one incoherent task: at `5 ms / LOW` it was the *shortest*-period task pinned to the
+*lowest* priority, violating both RM and DMS and creating a priority-inversion hazard on
+`data_lock` (a `LOW` back-cam holding the lock, preempted by `MEDIUM` Processing, blocks the
+`HIGH` front camera). Lengthening its period to **50 ms (20 Hz)** makes `LOW` the genuine
+longest-deadline task, restores a coherent priority order, and stops draining the rear socket
+at 200 Hz for no perceptual benefit (rear contour growth is easily tracked at 20 Hz).
 
 ### B. Lock-granularity fix
 Split skeleton's single `data_lock`: keep it for **frame slots only**, add `state_lock` for steering/throttle/event state. Camera threads never block on control state.
@@ -261,3 +278,75 @@ ML detectors, disk logging, tuning GUI, edits to Configuration / Scheduling / Ne
 3. **Red avoid trigger** — only when in center band; else ignored.
 4. **Initial `target_speed`** — 50 default; prefer 70 for faster start?
 
+---
+
+## Phase 3 — Pure-perception architecture (current)
+
+### Why we redesigned
+
+Reading the official poster (`game rule/RTSE_Poster_game.pdf`) made it clear the
+controller's job is **AI control in Unity using real-time camera input** — the Unity
+simulator is the authoritative state machine. The Phase 1–2 design maintained a
+parallel software state (target speed, last-hit timestamps, active events, swerve
+direction, police flag, cam-degrade flags) and rolled its own random yellow events.
+This was incorrect on three counts:
+
+1. **Double-counting** — `target_speed -= 20` after detecting red duplicated what
+   the game's scorekeeper already did to the *real* speed, on a variable nothing
+   could keep in sync.
+2. **Disconnected randomness** — our `_trigger_yellow_event` rolled a random pick
+   from a *guessed* event pool (`spawn_police`, `front_cam_degraded`, ...). The
+   actual yellow events listed on the poster are *input-corruption* events (next
+   token hidden, tokens invisible 5 s, camera input delay 5 s, action output delay
+   5 s, corrupted camera input 5 s) — entirely different. We were simulating the
+   wrong rules at the wrong time.
+3. **Backwards mitigation** — `_cam_degraded` slowed *our* reads on top of the
+   game's "camera input delay 5 s" event. The poster's intent is for the game to
+   degrade input quality; slowing our own reads further worsens reaction time.
+
+### What changed
+
+| Removed | Replaced with |
+| --- | --- |
+| `YELLOW_EVENTS` list and `_trigger_yellow_event` | Nothing — the game rolls the event; we react to its visible consequences |
+| `_apply_color_hit` (red −20 / green +10 / yellow → event) | Nothing — the game applies the real effect; the controller just steers |
+| `_expire_events`, `shared_data['active_events']` | A single `_lane_change_until` float for the trailing-car defensive swerve |
+| `shared_data['target_speed']`, `'police_active'`, `'last_hit_ts']`, `'swerve_dir'` | Module-level locals only when needed (`_lane_change_dir`, `_red_avoid` latch) |
+| `_cam_degraded`, `gated_read_front/back`, `CAM_BASE_PERIOD`, `CAM_DEGRADED_PERIOD` | Cameras call `read_*_camera_task` directly at full RTTask period |
+| `POLICE_THROTTLE_MULT` half-throttle while `police_active` | `_compute_steering` flips into **police-seek mode** when rear cam shows blue — actively steers toward red tokens (poster: "catch next red or −50% speed") |
+| `HIT_AREA_FRAC`, `COOLDOWN_S`, `EVENT_DURATION_S` | Removed — only the event engine consumed these |
+
+### What we added
+
+- **`image_detection.py`** — perception extracted into its own module: HSV
+  auto-calibration, contour shape filters, lane offset, brightness detection,
+  overlay rendering. The controller stays focused on RT scheduling concerns.
+- **`detect_low_brightness(frame)`** — mean V channel on a centre crop (HUD-free)
+  is below `LOW_BRIGHTNESS_THRESHOLD = 50`. This handles the poster's "low
+  brightness" event: when tokens may become invisible / all-yellow, ease throttle.
+- **`CRUISE_THROTTLE = 0.8` / `LOW_BRIGHTNESS_THROTTLE = 0.4`** — throttle is now
+  a one-line policy in `processing_task` rather than a derived function of a
+  shadow `target_speed`.
+
+### New steering priority (current)
+
+1. **POLICE-SEEK** — if rear cam sees blue AND front cam has a red, steer toward
+   it (`RED_AVOID_GAIN * red.centroid_x_norm`).
+2. **Red avoid** — committed lane change away from any red in the wide band, with
+   the 1.6 s latch + 0.35 s settle counter-steer phase.
+3. **Trailing-car forced swerve** — `_lane_change_until` timer.
+4. **Yellow avoid** — only if centred.
+5. **Green attract** — gentle P.
+6. **Lane follow** — Canny + HoughLinesP.
+7. Default `0.0`.
+
+### Verification (Phase 3)
+
+1. Start SpeedTrials2D, then `python sample_drive.py`. Confirm 4 "Started" lines.
+2. `"Perception"` window HUD reads `target=80 eff=80 police=0 events=[] str=0.00 acc=0.80`.
+3. Approach GREEN → `str` biases toward the green centroid.
+4. Approach RED in lane → 1.6 s swerve + 0.35 s settle, `events=[]` (no shadow log).
+5. Trailing car detected in rear → `events=[TRAILING_CAR]`, 1.5 s swerve, direction alternates each trigger.
+6. Police visible in rear → `events=[POLICE]`; if a red is in front, `str` flips to steer **toward** the red.
+7. Scene dims → `events=[LOW_LIGHT]`, `acc` drops to `0.40`.
+8. Ctrl+C → "System terminated cleanly." within ~1 s.

@@ -4,7 +4,7 @@ import struct
 import cv2
 import numpy as np
 import time
-import keyboard
+#import keyboard
 import select
 import ctypes
 

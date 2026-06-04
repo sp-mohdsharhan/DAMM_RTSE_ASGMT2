@@ -158,8 +158,20 @@ def _largest_contour_info(mask, roi_area, roi_x0=0):
     _, area, area_frac, x, y, w, h = best
     cx = x + w / 2.0 + roi_x0
     cy = y + h / 2.0
+
+    # NEW: enclosing circle
+    (circle_x, circle_y), radius = cv2.minEnclosingCircle(c)
+
     return {
         'bbox': (int(x + roi_x0), int(y), int(w), int(h)),
+
+        # NEW
+        'circle': (
+            int(circle_x + roi_x0),
+            int(circle_y),
+            int(radius)
+        ),
+
         'area_frac': area_frac,
         'centroid_x_norm': (cx - PROC_W / 2.0) / (PROC_W / 2.0),  # -1..+1
         'centroid_y': float(cy),
@@ -273,11 +285,40 @@ def detect_low_brightness(frame):
 def _draw_obj(img, info, label, color, y_offset=0):
     if info is None:
         return
-    x, y, w, h = info['bbox']
-    cv2.rectangle(img, (x, y + y_offset), (x + w, y + h + y_offset), color, 2)
-    cv2.putText(img, f"{label} {info['area_frac']*100:.1f}%",
-                (x, max(10, y + y_offset - 4)),
-                cv2.FONT_HERSHEY_SIMPLEX, 0.4, color, 1)
+
+    # Draw circle instead of rectangle
+    cx, cy, radius = info['circle']
+
+    cv2.circle(
+        img,
+        (cx, cy + y_offset),
+        radius,
+        color,
+        2
+    )
+
+    # Draw center point
+    cv2.circle(
+        img,
+        (cx, cy + y_offset),
+        3,
+        color,
+        -1
+    )
+
+    # Label
+    cv2.putText(
+        img,
+        f"{label} {info['area_frac']*100:.1f}%",
+        (
+            cx - radius,
+            max(15, cy - radius - 5 + y_offset)
+        ),
+        cv2.FONT_HERSHEY_SIMPLEX,
+        0.4,
+        color,
+        1
+    )
 
 
 def draw_overlay(front_per, rear_per, lane_offset, hud):

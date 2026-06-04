@@ -159,13 +159,22 @@ def _largest_contour_info(mask, roi_area, roi_x0=0):
     cx = x + w / 2.0 + roi_x0
     cy = y + h / 2.0
 
-    # NEW: enclosing circle
-    (circle_x, circle_y), radius = cv2.minEnclosingCircle(c)
+    # NEW: area-equivalent circle (tighter than minEnclosingCircle)
+
+    M = cv2.moments(c)
+
+    if M["m00"] > 0:
+        circle_x = M["m10"] / M["m00"]
+        circle_y = M["m01"] / M["m00"]
+    else:
+        circle_x = x + w / 2.0
+        circle_y = y + h / 2.0
+
+    radius = np.sqrt(area / np.pi)
 
     return {
         'bbox': (int(x + roi_x0), int(y), int(w), int(h)),
 
-        # NEW
         'circle': (
             int(circle_x + roi_x0),
             int(circle_y),

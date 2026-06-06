@@ -1,9 +1,12 @@
 # DAMM_RTSE_ASGMT2 — SpeedTrials2D Autonomous Driver
 
-> **SECJ 4423 — REAL-TIME SOFTWARE ENGINEERING**
-> **Semester II 2025/2026 — Group Assignment 2**
-> **Lecturer:** Prof. Ts. Dr. Dayang Norhayati Bte. Abang Jawawi
-> **Group:** DAMM
+**SECJ 4423 — REAL-TIME SOFTWARE ENGINEERING**
+
+**Semester II, Academic Session 2025/2026 — Group Assignment 2**
+
+**Lecturer**:  Prof. Ts. Dr. Dayang Norhayati Bte. Abang Jawawi
+
+**Group**:  DAMM
 
 ## Group Members
 

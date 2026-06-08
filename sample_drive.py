@@ -41,23 +41,33 @@ FRONT_CAMERA_PORT = 8080
 BACK_CAMERA_PORT = 8082
 CONTROL_HOST = '127.0.0.1'
 CONTROL_PORT = 8081
+STALENESS_BUDGET_S = 0.040              # 2 × SendControls period
+SHOW_DEBUG = True
 
 # Shared Resources with Mutex Lock for Concurrency
-# data_lock:  scoped to raw frame slots only (read by perception, written by camera tasks)
-# state_lock: control-command mutations (kept separate to avoid blocking camera I/O)
-shared_data = {
-    'latest_front_frame': None,
-    'latest_back_frame': None,
-    'steering_input' : 0.0,
-    'acceleration_input' : 0.0,
-    # --- control commands written by Processing, read by SendControls ---
-    'steering_cmd': 0.0,
-    'accel_cmd': 0.0,
-    'perception_front': {},
-    'perception_back': {},
-}
-data_lock = threading.Lock()
-state_lock = threading.Lock()
+# Slots provide bounded, drop-oldest hand-off between stages.
+class LatestSlot:
+    """Single-slot, lock-protected, drop-oldest hand-off."""
+    def __init__(self):
+        self._lock = threading.Lock()
+        self._value = None
+        self._ts = 0.0
+
+    def put(self, value):
+        with self._lock:
+            self._value = value
+            self._ts = time.perf_counter()
+
+    def get(self):
+        with self._lock:
+            return self._value, self._ts
+
+front_frame_slot   = LatestSlot()
+rear_frame_slot    = LatestSlot()
+perception_slot    = LatestSlot()
+command_slot       = LatestSlot()
+debug_render_slot  = LatestSlot()
+
 is_running = True
 
 # ---------------------------------------------------------
@@ -167,18 +177,18 @@ def setup_control_server():
 # Task Implementations (This is where you write your tasks)
 # ---------------------------------------------------------
 
-def read_single_camera(sock, window_name, data_key):
-    #This function reads the latest frame from the camera socket and stores it in the shared data
+def read_single_camera(sock, window_name, output_slot):
+    # This function reads the latest frame from the camera socket and stores it in the pipeline slot.
     if sock is None:
         return
-        
+
     try:
         latest_frame_data = None
         sock.settimeout(None)
         length_bytes = sock.recv(4)
         if not length_bytes:
             return
-            
+
         image_length = int.from_bytes(length_bytes, 'little')
         received_bytes = b''
         while len(received_bytes) < image_length and is_running:
@@ -186,15 +196,15 @@ def read_single_camera(sock, window_name, data_key):
             if not packet:
                 break
             received_bytes += packet
-            
+
         if len(received_bytes) == image_length:
             latest_frame_data = received_bytes
-            
+
         while is_running:
             readable, _, _ = select.select([sock], [], [], 0.0)
             if not readable:
                 break
-                
+
             sock.settimeout(1.0)
             length_bytes = sock.recv(4)
             if not length_bytes:
@@ -206,30 +216,24 @@ def read_single_camera(sock, window_name, data_key):
                 if not packet:
                     break
                 received_bytes += packet
-                
+
             if len(received_bytes) == image_length:
                 latest_frame_data = received_bytes
-                
+
         if latest_frame_data is not None:
             np_arr = np.frombuffer(latest_frame_data, np.uint8)
             frame = cv2.imdecode(np_arr, cv2.IMREAD_COLOR)
             if frame is not None:
-                with data_lock:
-                    shared_data[data_key] = frame
-                
-                # You may disable this if you don't need to display the frames / This could effect the fps
-                frame_resized = cv2.resize(frame, (640, 480))
-                cv2.imshow(window_name, frame_resized)
-                cv2.waitKey(1)
-                
-    except Exception as e:
+                output_slot.put(frame)
+
+    except Exception:
         pass
 
 def read_front_camera_task():
-    read_single_camera(front_camera_sock, "Front Camera", 'latest_front_frame')
+    read_single_camera(front_camera_sock, "Front Camera", front_frame_slot)
 
 def read_back_camera_task():
-    read_single_camera(back_camera_sock, "Back Camera", 'latest_back_frame')
+    read_single_camera(back_camera_sock, "Back Camera", rear_frame_slot)
 
 # =========================================================
 # Controller (perception lives in image_detection.py)
@@ -240,7 +244,7 @@ def read_back_camera_task():
 
 # Trailing-car defensive swerve timer (poster: "must switch lanes before
 # collision or -50% speed"). Single source of truth; replaces what used to
-# be tracked in shared_data['active_events'] + 'swerve_dir'.
+# be tracked in shadowed event state.
 _lane_change_until = 0.0
 _lane_change_dir = 1                     # alternates +1 / -1 per trigger
 # Red avoidance latch: once a red is detected ahead, commit to a full
@@ -302,64 +306,85 @@ def _compute_steering(front_per, lane_offset, force_lane_change, swerve_dir, pol
     # 6) Default
     return 0.0
 
-def processing_task():
-    # Snapshot frame references under data_lock (fast), then release.
-    with data_lock:
-        front_frame = shared_data['latest_front_frame']
-        back_frame = shared_data['latest_back_frame']
+def perception_task():
+    front_frame, _ = front_frame_slot.get()
+    rear_frame, _ = rear_frame_slot.get()
 
-    if front_frame is None and back_frame is None:
+    if front_frame is None:
         return
 
     # Autonomous HSV calibration (warm-up only)
-    if not calibration_done() and front_frame is not None:
+    if not calibration_done():
         calibrate_step(front_frame)
 
-    # Perception (lock-free)
-    front_per   = detect_front_objects(front_frame) if front_frame is not None else None
-    lane_offset = detect_lane_offset(front_frame)   if front_frame is not None else None
-    rear_per    = detect_rear(back_frame)           if back_frame is not None else None
-    low_light   = detect_low_brightness(front_frame) if front_frame is not None else False
+    front_per = detect_front_objects(front_frame)
+    lane_offset = detect_lane_offset(front_frame)
+    rear_per = detect_rear(rear_frame) if rear_frame is not None else None
+    low_light = detect_low_brightness(front_frame)
+
+    perception_slot.put({
+        'front_per': front_per,
+        'rear_per': rear_per,
+        'lane_offset': lane_offset,
+        'low_light': low_light,
+    })
+
+
+def planner_task():
+    per, _ = perception_slot.get()
+    if per is None:
+        return
+
+    front_per = per['front_per']
+    rear_per = per['rear_per']
+    lane_offset = per['lane_offset']
+    low_light = per['low_light']
 
     now = time.monotonic()
-
-    # Trailing-car defensive swerve (poster event). Arm only when not already
-    # swerving so a single sustained "growing" reading doesn't continuously
-    # re-arm and pin steering. Direction flips each new trigger.
     global _lane_change_until, _lane_change_dir
     if rear_per is not None and rear_per['other_car']['growing'] and now >= _lane_change_until:
         _lane_change_until = now + LANE_CHANGE_DURATION_S
         _lane_change_dir = -_lane_change_dir
     force_lc = now < _lane_change_until
 
-    # Police visible in rear -> seek-mode flag (consumed by steering).
-    # Cleared the instant the rear cam no longer sees blue; the game decides
-    # when the underlying penalty actually lifts.
     police_seen = bool(rear_per and rear_per['police']['present'])
-
-    # Steering: pure reaction to perception.
     steering = _compute_steering(front_per, lane_offset, force_lc, _lane_change_dir, police_seen)
-
-    # Throttle: constant cruise. Eased back under low brightness (token visibility
-    # is degraded, so accept the speed cost in exchange for more reaction time).
     accel = LOW_BRIGHTNESS_THROTTLE if low_light else CRUISE_THROTTLE
 
-    with state_lock:
-        shared_data['steering_cmd'] = steering
-        shared_data['accel_cmd'] = accel
-        shared_data['perception_front'] = front_per or {}
-        shared_data['perception_back'] = rear_per or {}
+    command_slot.put({'steer': steering, 'accel': accel})
+    debug_render_slot.put((per, {'steer': steering, 'accel': accel}))
 
-    # Overlay (own window; does NOT edit locked read_single_camera).
+
+def debug_render_task():
+    if not SHOW_DEBUG:
+        return
+
+    payload, _ = debug_render_slot.get()
+    if payload is None:
+        return
+
+    per, cmd = payload
+    front_per = per['front_per']
+    rear_per = per['rear_per']
+    lane_offset = per['lane_offset']
+    low_light = per['low_light']
+
     try:
         events_visible = []
-        if force_lc:     events_visible.append('TRAILING_CAR')
-        if police_seen:  events_visible.append('POLICE')
-        if low_light:    events_visible.append('LOW_LIGHT')
+        now = time.monotonic()
+        if now < _lane_change_until:
+            events_visible.append('TRAILING_CAR')
+        if bool(rear_per and rear_per['police']['present']):
+            events_visible.append('POLICE')
+        if low_light:
+            events_visible.append('LOW_LIGHT')
         hud = {
-            'target': accel * 100.0, 'eff': accel * 100.0,
-            'police': police_seen, 'events': events_visible,
-            'str': steering, 'acc': accel,
+            'target': cmd['accel'] * 100.0,
+            'eff': cmd['accel'] * 100.0,
+            'police': bool(rear_per and rear_per['police']['present']),
+            'events': events_visible,
+            'str': cmd['steer'],
+            'acc': cmd['accel'],
         }
         overlay = draw_overlay(front_per, rear_per, lane_offset, hud)
         cv2.imshow("Perception", overlay)
@@ -367,26 +392,20 @@ def processing_task():
     except Exception:
         pass
 
-# Last successfully-sent command — used as non-blocking fallback
-_last_sent = {'steering': 0.0, 'accel': 0.0}
 
 def send_controls_task():
     global control_conn
     if control_conn is None:
         return
 
-    # Non-blocking acquire: if processing thread is mid-write, reuse last command
-    if state_lock.acquire(blocking=False):
-        try:
-            steering_input = shared_data['steering_cmd']
-            acceleration_input = shared_data['accel_cmd']
-        finally:
-            state_lock.release()
-        _last_sent['steering'] = steering_input
-        _last_sent['accel'] = acceleration_input
+    cmd, ts = command_slot.get()
+    now = time.perf_counter()
+    if cmd is None or (now - ts) > STALENESS_BUDGET_S:
+        steering_input = 0.0
+        acceleration_input = 0.0
     else:
-        steering_input = _last_sent['steering']
-        acceleration_input = _last_sent['accel']
+        steering_input = cmd['steer']
+        acceleration_input = cmd['accel']
 
     try:
         data = struct.pack('ff', steering_input, acceleration_input)
@@ -417,21 +436,24 @@ if __name__ == '__main__':
     # read_*_camera_task directly — input corruption / delay is the game's
     # job, so we do not gate or throttle our own reads.
     #   ReadFrontCamera 5ms  HIGH   - collision-critical input (red orbs ahead); shortest deadline.
-    #   SendControls   20ms  HIGH   - hard 50Hz actuator deadline; stale output = car drives blind.
-    #   Processing     33ms  MEDIUM - the brain (perception -> steering/accel); above the rear
-    #                                 camera so a slow rear frame can never starve it.
-    #   ReadBackCamera 50ms  LOW    - rear threats (police / trailing car) evolve slowly:
-    #                                 longest deadline -> lowest priority.
+    #   Planner        20ms  HIGH   - hard 50Hz actuator deadline; stale output = car drives blind.
+    #   Perception     33ms  MEDIUM - detection / lane / brightness estimation.
+    #   ReadBackCamera 50ms  LOW    - rear threats (police / trailing car) evolve slowly.
+    #   DebugRender    66ms  LOW    - overlay rendering and HUD updates run on their own task.
     t_front_camera = RTTask("ReadFrontCamera", period=0.005, priority=TaskPriority.HIGH,  execute_func=read_front_camera_task)
     t_back_camera  = RTTask("ReadBackCamera",  period=0.050, priority=TaskPriority.LOW,   execute_func=read_back_camera_task)
-    t_processing   = RTTask("Processing",      period=0.033, priority=TaskPriority.MEDIUM, execute_func=processing_task)
-    t_controls     = RTTask("SendControls",    period=0.020, priority=TaskPriority.HIGH,  execute_func=send_controls_task)
+    t_perception   = RTTask("Perception",      period=0.033, priority=TaskPriority.MEDIUM, execute_func=perception_task)
+    t_planner      = RTTask("Planner",         period=0.020, priority=TaskPriority.HIGH,   execute_func=planner_task)
+    t_controls     = RTTask("SendControls",    period=0.020, priority=TaskPriority.HIGH,   execute_func=send_controls_task)
+    t_debug        = RTTask("DebugRender",     period=0.066, priority=TaskPriority.LOW,    execute_func=debug_render_task)
     
     # Start tasks to run concurrently
     t_front_camera.start()
     t_back_camera.start()
-    t_processing.start()
+    t_perception.start()
+    t_planner.start()
     t_controls.start()
+    t_debug.start()
     
     try:
         # You need this to keep the main thread alive, otherwise the program will exit immediately
@@ -444,8 +466,10 @@ if __name__ == '__main__':
     # This is to make sure that the tasks are terminated cleanly
     t_front_camera.join()
     t_back_camera.join()
-    t_processing.join()
+    t_perception.join()
+    t_planner.join()
     t_controls.join()
+    t_debug.join()
     
     # This is to close all the connections
     if front_camera_sock:

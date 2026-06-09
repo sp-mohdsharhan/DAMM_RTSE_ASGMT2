@@ -19,19 +19,20 @@ from image_detection import (
     RED_AVOID_AREA_FRAC, RED_AVOID_BAND_FRAC,
     RED_LANE_CHANGE_DURATION_S, RED_SETTLE_DURATION_S,
     YELLOW_AVOID_AREA_FRAC, CENTER_BAND_FRAC,
-    LANE_CHANGE_DURATION_S, LANE_CHANGE_STEER,
     GREEN_ATTRACT_GAIN, GREEN_ATTRACT_MIN_AREA,
     RED_AVOID_GAIN, YELLOW_AVOID_GAIN, LANE_GAIN,
+    LANE_CURVE_GAIN, HILL_AREA_SCALE,
     # functions
     detect_front_objects, detect_rear, detect_lane_offset,
     detect_lane_curve, draw_lane_curve_debug,
-    detect_low_brightness, draw_overlay,
+    detect_low_brightness, detect_slope, draw_overlay,
     calibrate_step, calibration_done,
 )
 
 # Controller-policy throttle constants (NOT perception — live here).
 CRUISE_THROTTLE = 0.8                    # normal forward cruise
 LOW_BRIGHTNESS_THROTTLE = 0.4            # ease off when scene is dim (tokens may be invisible / all-yellow)
+HILL_THROTTLE = 0.5                      # on a hill, don't accelerate — coast so we can react at the crest
 
 
 # ---------------------------------------------------------
@@ -239,68 +240,95 @@ def read_back_camera_task():
 # observes the cameras frame-by-frame and emits (steering, accel). No
 # parallel simulation of game rules is kept in software.
 
-# Trailing-car defensive swerve timer (poster: "must switch lanes before
-# collision or -50% speed"). Single source of truth; replaces what used to
-# be tracked in shared_data['active_events'] + 'swerve_dir'.
-_lane_change_until = 0.0
-_lane_change_dir = 1                     # alternates +1 / -1 per trigger
 # Red avoidance latch: once a red is detected ahead, commit to a full
 # lane-change away from it for RED_LANE_CHANGE_DURATION_S, then a brief
 # counter-steer settle phase to straighten out in the new lane.
 _red_avoid = {'until': 0.0, 'settle_until': 0.0, 'dir': 0}
 
-def _compute_steering(front_per, lane_offset, force_lane_change, swerve_dir, police_seen):
+# ---------------------------------------------------------------------------
+# REMOVED behaviours (kept here for future reference)
+# ---------------------------------------------------------------------------
+# This game build has no police vehicle and no trailing/overtaking car, so the
+# two rear-threat reactions that used to sit ABOVE the colour stack were removed:
+#
+#   * POLICE-SEEK MODE — when the rear camera saw police-blue and a red was
+#     ahead, steering inverted to drive TOWARD the red centroid
+#     (poster rule "catch the next red token or -50% speed"):
+#         if police_seen and red and red.area_frac > RED_AVOID_AREA_FRAC:
+#             return clip(RED_AVOID_GAIN * red.centroid_x_norm)
+#
+#   * TRAILING-CAR FORCED SWERVE — a rear contour growing frame-over-frame armed
+#     a fixed ±LANE_CHANGE_STEER swerve for LANE_CHANGE_DURATION_S, direction
+#     alternating each trigger (tracked via _lane_change_until / _lane_change_dir):
+#         if force_lane_change:
+#             return LANE_CHANGE_STEER * swerve_dir
+#
+# If a future build reintroduces police / trailing cars, restore detect_rear()
+# consumption in processing_task, re-add the _lane_change_* timer, and re-insert
+# these two branches at the TOP of _compute_steering (they are safety/penalty
+# overrides and must outrank the colour priorities below). The matching
+# constants (LANE_CHANGE_DURATION_S, LANE_CHANGE_STEER) still live in
+# image_detection.py.
+# ---------------------------------------------------------------------------
+
+def _compute_steering(front_per, lane_offset, curve_bias, hill):
+    """Steering priority stack (highest wins):
+       1. GREEN seek   — literal override: green wins whenever it is visible.
+       2. RED  evade   — committed lane change away from red, with latch + settle.
+       3. YELLOW evade — swerve away when centred & close.
+       4. Lane follow  — instantaneous offset + anticipated curve bias.
+    On a hill the red/yellow trigger areas shrink (HILL_AREA_SCALE) so evasion
+    fires earlier — the car "prepares for a lane change" before orbs crest fully.
+    """
     now = time.monotonic()
-    red = front_per['red'] if front_per else None
+    red    = front_per['red']    if front_per else None
+    green  = front_per['green']  if front_per else None
+    yellow = front_per['yellow'] if front_per else None
 
-    # 0) POLICE-SEEK MODE: poster rule "catch next red token or -50% speed".
-    #    Invert red behaviour while police is visible in the rear — actively steer
-    #    TOWARD the red centroid instead of avoiding it.
-    if police_seen and red is not None and red['area_frac'] > RED_AVOID_AREA_FRAC:
-        return float(np.clip(RED_AVOID_GAIN * red['centroid_x_norm'], -1.0, 1.0))
+    # Hill: orbs crest into view late -> lower the trigger areas so we react sooner.
+    red_area_thr    = RED_AVOID_AREA_FRAC    * (HILL_AREA_SCALE if hill else 1.0)
+    yellow_area_thr = YELLOW_AVOID_AREA_FRAC * (HILL_AREA_SCALE if hill else 1.0)
 
-    # 1) Red avoidance — commit to a lane change away from any red ahead.
-    if red is not None and red['area_frac'] > RED_AVOID_AREA_FRAC \
+    # 1) GREEN SEEK (priority #1) — steer toward green, anticipating the bend.
+    if green is not None and green['area_frac'] > GREEN_ATTRACT_MIN_AREA:
+        return float(np.clip(GREEN_ATTRACT_GAIN * green['centroid_x_norm']
+                             + LANE_CURVE_GAIN * curve_bias, -1.0, 1.0))
+
+    # 2) RED EVADE — commit to a lane change away from any red ahead.
+    if red is not None and red['area_frac'] > red_area_thr \
             and abs(red['centroid_x_norm']) < RED_AVOID_BAND_FRAC:
         direction = -1 if red['centroid_x_norm'] >= 0 else 1
         _red_avoid['until'] = now + RED_LANE_CHANGE_DURATION_S
         _red_avoid['settle_until'] = _red_avoid['until'] + RED_SETTLE_DURATION_S
         _red_avoid['dir'] = direction
         return float(RED_AVOID_GAIN * direction)
-    # 1b) Red-avoid latch (swerve phase): hold the lane change.
+    # 2b) Red-avoid latch (swerve phase): hold the lane change.
     #     If a new red appears on the side we're swerving toward, flip direction.
     if now < _red_avoid['until']:
-        if red is not None and red['area_frac'] > RED_AVOID_AREA_FRAC:
+        if red is not None and red['area_frac'] > red_area_thr:
             red_side = 1 if red['centroid_x_norm'] >= 0 else -1
             if red_side == _red_avoid['dir']:
                 _red_avoid['dir'] = -_red_avoid['dir']
                 _red_avoid['until'] = now + RED_LANE_CHANGE_DURATION_S
                 _red_avoid['settle_until'] = _red_avoid['until'] + RED_SETTLE_DURATION_S
         return float(RED_AVOID_GAIN * _red_avoid['dir'])
-    # 1c) Settle phase: brief counter-steer to straighten out.
+    # 2c) Settle phase: brief counter-steer to straighten out.
     if now < _red_avoid['settle_until']:
         return float(-0.5 * _red_avoid['dir'])
 
-    # 2) Trailing-car forced lane change
-    if force_lane_change:
-        return LANE_CHANGE_STEER * swerve_dir
-
-    # 3) Yellow avoidance if in lane band & close
-    yellow = front_per['yellow'] if front_per else None
-    if yellow is not None and yellow['area_frac'] > YELLOW_AVOID_AREA_FRAC \
+    # 3) YELLOW EVADE — swerve away if in lane band & close.
+    if yellow is not None and yellow['area_frac'] > yellow_area_thr \
             and abs(yellow['centroid_x_norm']) < CENTER_BAND_FRAC:
         return float(np.clip(-YELLOW_AVOID_GAIN * np.sign(yellow['centroid_x_norm'] or 1.0), -1, 1))
 
-    # 4) Green attraction (gentle)
-    green = front_per['green'] if front_per else None
-    if green is not None and green['area_frac'] > GREEN_ATTRACT_MIN_AREA:
-        return float(np.clip(GREEN_ATTRACT_GAIN * green['centroid_x_norm'], -1, 1))
-
-    # 5) Lane following
+    # 4) Lane following + anticipated curve bias.
     if lane_offset is not None:
-        return float(np.clip(LANE_GAIN * lane_offset, -1, 1))
+        return float(np.clip(LANE_GAIN * lane_offset + LANE_CURVE_GAIN * curve_bias, -1, 1))
+    # No lane lines but a warped curve estimate is available -> follow the bend.
+    if curve_bias:
+        return float(np.clip(LANE_CURVE_GAIN * curve_bias, -1, 1))
 
-    # 6) Default
+    # 5) Default
     return 0.0
 
 def processing_task():
@@ -319,31 +347,32 @@ def processing_task():
     # Perception (lock-free)
     front_per   = detect_front_objects(front_frame) if front_frame is not None else None
     lane_offset = detect_lane_offset(front_frame)   if front_frame is not None else None
+    # Rear perception still rendered for the REAR overlay panel, but no longer
+    # consumed by steering (police-seek / trailing-car reactions removed — this
+    # build has neither; see the REMOVED block above _compute_steering).
     rear_per    = detect_rear(back_frame)           if back_frame is not None else None
     low_light   = detect_low_brightness(front_frame) if front_frame is not None else False
 
-    now = time.monotonic()
+    # Lane-curve readout (also drives the "Lane Curve" debug window below, so we
+    # compute it once here and reuse it). curve_bias anticipates the bend.
+    curve_dbg  = detect_lane_curve(front_frame) if front_frame is not None else None
+    curve_bias = curve_dbg['curve_bias'] if curve_dbg else 0.0
 
-    # Trailing-car defensive swerve (poster event). Arm only when not already
-    # swerving so a single sustained "growing" reading doesn't continuously
-    # re-arm and pin steering. Direction flips each new trigger.
-    global _lane_change_until, _lane_change_dir
-    if rear_per is not None and rear_per['other_car']['growing'] and now >= _lane_change_until:
-        _lane_change_until = now + LANE_CHANGE_DURATION_S
-        _lane_change_dir = -_lane_change_dir
-    force_lc = now < _lane_change_until
+    # Hill / slope: ease throttle and trigger evasion earlier when on a crest.
+    slope = detect_slope(front_frame) if front_frame is not None else None
+    hill  = bool(slope and slope['is_hill'])
 
-    # Police visible in rear -> seek-mode flag (consumed by steering).
-    # Cleared the instant the rear cam no longer sees blue; the game decides
-    # when the underlying penalty actually lifts.
-    police_seen = bool(rear_per and rear_per['police']['present'])
+    # Steering: pure reaction to perception (green-seek > red-evade > yellow-evade > lane).
+    steering = _compute_steering(front_per, lane_offset, curve_bias, hill)
 
-    # Steering: pure reaction to perception.
-    steering = _compute_steering(front_per, lane_offset, force_lc, _lane_change_dir, police_seen)
-
-    # Throttle: constant cruise. Eased back under low brightness (token visibility
-    # is degraded, so accept the speed cost in exchange for more reaction time).
-    accel = LOW_BRIGHTNESS_THROTTLE if low_light else CRUISE_THROTTLE
+    # Throttle: constant cruise, eased on hills (don't accelerate at the crest)
+    # and under low brightness (degraded token visibility -> buy reaction time).
+    if hill:
+        accel = HILL_THROTTLE
+    elif low_light:
+        accel = LOW_BRIGHTNESS_THROTTLE
+    else:
+        accel = CRUISE_THROTTLE
 
     with state_lock:
         shared_data['steering_cmd'] = steering
@@ -354,23 +383,19 @@ def processing_task():
     # Overlay (own window; does NOT edit locked read_single_camera).
     try:
         events_visible = []
-        if force_lc:     events_visible.append('TRAILING_CAR')
-        if police_seen:  events_visible.append('POLICE')
-        if low_light:    events_visible.append('LOW_LIGHT')
+        if hill:       events_visible.append('HILL')
+        if low_light:  events_visible.append('LOW_LIGHT')
         hud = {
             'target': accel * 100.0, 'eff': accel * 100.0,
-            'police': police_seen, 'events': events_visible,
+            'police': False, 'events': events_visible,
             'str': steering, 'acc': accel,
         }
         overlay = draw_overlay(front_per, rear_per, lane_offset, hud)
         cv2.imshow("Perception", overlay)
-        # CL0-CL2 visualization-only debug window. Computed here so the
-        # steering pipeline above stays untouched. Cheap (~3-6 ms at 320x240).
-        if front_frame is not None:
-            curve_dbg = detect_lane_curve(front_frame)
-            curve_panel = draw_lane_curve_debug(curve_dbg)
-            if curve_panel is not None:
-                cv2.imshow("Lane Curve", curve_panel)
+        # CL0-CL2 lane-curve debug window (reuses curve_dbg computed above).
+        curve_panel = draw_lane_curve_debug(curve_dbg)
+        if curve_panel is not None:
+            cv2.imshow("Lane Curve", curve_panel)
         cv2.waitKey(1)
     except Exception:
         pass

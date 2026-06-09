@@ -13,16 +13,19 @@ PUBLIC SURFACE (everything below is consumed by sample_drive.py):
     LANE_CHANGE_DURATION_S, LANE_CHANGE_STEER,
     GREEN_ATTRACT_GAIN, GREEN_ATTRACT_MIN_AREA,
     RED_AVOID_GAIN, YELLOW_AVOID_GAIN, LANE_GAIN,
+    LANE_CURVE_GAIN, HILL_AREA_SCALE,
     LOW_BRIGHTNESS_THRESHOLD,
 - Functions:
     detect_front_objects(frame) -> dict
     detect_rear(frame)          -> dict
     detect_lane_offset(frame)   -> float | None
-    detect_lane_curve(frame)    -> dict | None   (CL0-CL2: bird's-eye + sliding-window;
-                                                  VISUALIZATION-ONLY for now, not consumed
-                                                  by the steering controller)
+    detect_lane_curve(frame)    -> dict | None   (CL0-CL2 bird's-eye + sliding-window for the
+                                                  debug panel; also returns 'curve_bias' (-1..+1)
+                                                  consumed by the steering controller)
     draw_lane_curve_debug(dbg)  -> ndarray | None (composite warp/mask/windows panel)
     detect_low_brightness(frame) -> bool        (poster: "low brightness" event)
+    detect_slope(frame)         -> dict | None  (hill / pitch estimate; 'is_hill' drives
+                                                  throttle ease + earlier evasion)
     draw_overlay(front_per, rear_per, lane_offset, hud) -> ndarray
     calibrate_step(frame)       -> None         (autonomous HSV warm-up)
     calibration_done()          -> bool
@@ -59,11 +62,30 @@ CENTER_BAND_FRAC = 0.55                  # |x_norm| < this counts as "in path"
 LANE_CHANGE_DURATION_S = 1.5             # trailing-car defensive swerve
 LANE_CHANGE_STEER = 0.8
 
-GREEN_ATTRACT_GAIN = 0.5                 # gentle pull toward green; don't get dragged into reds
+GREEN_ATTRACT_GAIN = 0.6                 # pull toward green; green is now steering priority #1
 GREEN_ATTRACT_MIN_AREA = 0.005           # ignore tiny far-away greens (false attractors)
 RED_AVOID_GAIN = 1.0                     # full-lock swerve when red is in path
 YELLOW_AVOID_GAIN = 0.9
 LANE_GAIN = 0.6
+
+# Lane-curve steering bias: how strongly the anticipated bend from
+# detect_lane_curve() biases steering on top of the instantaneous lane offset.
+# Lets the car steer into a curve before the near lane offset has moved.
+LANE_CURVE_GAIN = 0.4
+
+# Hill / slope handling (consumed by the controller in sample_drive.py).
+# On a crest the road horizon shifts up and orbs appear with little reaction
+# distance, so the controller (a) eases throttle and (b) shrinks the red/yellow
+# trigger areas via HILL_AREA_SCALE so evasion fires earlier ("prepare to swerve").
+SLOPE_HILL_DEV = 0.06                    # |horizon deviation from flat baseline| to call it a hill
+SLOPE_EMA_ALPHA = 0.05                   # EMA rate for the self-calibrating flat-road baseline
+HILL_AREA_SCALE = 0.5                    # scale red/yellow trigger area thresholds on a hill (evade sooner)
+ASPHALT_MAX_SAT = 60                     # road asphalt is low-saturation gray
+ASPHALT_MIN_VAL = 30
+ASPHALT_MAX_VAL = 170
+ROAD_ROW_THRESH = 0.20                   # fraction of center-band asphalt for a row to count as "road"
+SLOPE_CENTER_BAND = (0.30, 0.70)         # center column fraction used to locate the road horizon
+SLOPE_GAP_TOL = 8                        # rows of non-road (lane dashes) tolerated before the road top
 
 # Low-brightness event detection (poster: "low brightness — turn light on or all tokens yellow")
 LOW_BRIGHTNESS_THRESHOLD = 50            # mean V channel below this -> consider it dim
@@ -423,18 +445,61 @@ def _sliding_window_collect(mask, base_x):
     return np.empty(0, np.int32), np.empty(0, np.int32), rects
 
 
+def _curve_bias_from_pixels(lx, ly, rx, ry):
+    """Estimate how much the lane bends ahead, in -1..+1 (positive => bends right).
+
+    Fits x = f(y) for whichever rails carry enough pixels, evaluates the lane
+    centre near the car (warp bottom) vs far ahead (warp top), and returns the
+    normalized horizontal drift between them plus the near lane-centre offset.
+    Returns (curve_bias, lane_center_norm); curve_bias is 0.0 and
+    lane_center_norm is None when there isn't enough signal."""
+    y_near = IPM_DST_H - 1
+    y_far = int(IPM_DST_H * 0.15)
+
+    def fit_eval(xs, ys):
+        if xs.size < MIN_WINDOW_PIX:
+            return None, None
+        deg = 2 if xs.size > 200 else 1
+        coeffs = np.polyfit(ys, xs, deg)
+        return float(np.polyval(coeffs, y_near)), float(np.polyval(coeffs, y_far))
+
+    lnear, lfar = fit_eval(lx, ly)
+    rnear, rfar = fit_eval(rx, ry)
+
+    if lnear is not None and rnear is not None:
+        c_near = (lnear + rnear) / 2.0
+        c_far = (lfar + rfar) / 2.0
+    elif lnear is not None:
+        c_near, c_far = lnear, lfar
+    elif rnear is not None:
+        c_near, c_far = rnear, rfar
+    else:
+        return 0.0, None
+
+    half = IPM_DST_W / 2.0
+    curve_bias = float(np.clip((c_far - c_near) / half, -1.0, 1.0))
+    lane_center_norm = float(np.clip((c_near - half) / half, -1.0, 1.0))
+    return curve_bias, lane_center_norm
+
+
 def detect_lane_curve(frame):
-    """CL0-CL2 entry point. Visualization-only for now.
+    """CL0-CL2 entry point + lightweight curve-bias readout (CL3-lite).
+
+    The bird's-eye warp / mask / sliding-window outputs remain visualization
+    fodder (draw_lane_curve_debug); the controller now also consumes the
+    'curve_bias' scalar to anticipate bends (see LANE_CURVE_GAIN).
 
     Returns dict with keys (or None if frame is None):
-        'warp'       : warped BGR (IPM_DST_H x IPM_DST_W x 3)
-        'mask'       : binary lane-pixel mask (same HxW as warp, uint8 0/255)
-        'left_pts'   : (xs, ys) ndarray pair of left-rail pixels in warp space
-        'right_pts'  : (xs, ys) ndarray pair of right-rail pixels in warp space
-        'left_rects' : list of (x_lo, y_lo, x_hi, y_hi) windows (for overlay)
-        'right_rects': same for right side
-        'left_base'  : seed x or None
-        'right_base' : seed x or None
+        'warp'            : warped BGR (IPM_DST_H x IPM_DST_W x 3)
+        'mask'            : binary lane-pixel mask (same HxW as warp, uint8 0/255)
+        'left_pts'        : (xs, ys) ndarray pair of left-rail pixels in warp space
+        'right_pts'       : (xs, ys) ndarray pair of right-rail pixels in warp space
+        'left_rects'      : list of (x_lo, y_lo, x_hi, y_hi) windows (for overlay)
+        'right_rects'     : same for right side
+        'left_base'       : seed x or None
+        'right_base'      : seed x or None
+        'curve_bias'      : -1..+1 anticipated bend (positive => bends right), 0.0 if unknown
+        'lane_center_norm': -1..+1 near lane-centre offset, or None if unknown
     """
     if frame is None:
         return None
@@ -446,6 +511,7 @@ def detect_lane_curve(frame):
     left_base, right_base = _histogram_base(mask)
     lx, ly, lrects = _sliding_window_collect(mask, left_base)
     rx, ry, rrects = _sliding_window_collect(mask, right_base)
+    curve_bias, lane_center_norm = _curve_bias_from_pixels(lx, ly, rx, ry)
     return {
         'warp': warp,
         'mask': mask,
@@ -455,6 +521,8 @@ def detect_lane_curve(frame):
         'right_rects': rrects,
         'left_base':  left_base,
         'right_base': right_base,
+        'curve_bias': curve_bias,
+        'lane_center_norm': lane_center_norm,
     }
 
 
@@ -509,6 +577,78 @@ def detect_low_brightness(frame):
     crop = frame[h // 4: h * 3 // 4, w // 4: w * 3 // 4]
     hsv = cv2.cvtColor(crop, cv2.COLOR_BGR2HSV)
     return float(hsv[:, :, 2].mean()) < LOW_BRIGHTNESS_THRESHOLD
+
+
+# ---------------------------------------------------------------------------
+# Hill / slope detection (heuristic)
+# ---------------------------------------------------------------------------
+# Self-calibrating baseline of the "flat-road" horizon row. Updated only on
+# (near-)flat frames so a sustained hill can't drag the baseline toward itself.
+_slope_state = {'baseline': None}
+
+
+def detect_slope(frame):
+    """Heuristic hill / pitch estimate from how high the drivable asphalt reaches.
+
+    On flat road the asphalt narrows to the horizon at a roughly constant frame
+    row. A crest (uphill) cuts the view short so the road top sits higher in the
+    frame; a dip lets the road reach lower. We walk up the center column band
+    from the bottom to find the road's top edge, track an EMA of the flat
+    baseline, and flag a hill when the current horizon deviates from it.
+
+    Returns dict {'horizon_frac','deviation','is_hill','uphill'} or None if no
+    road is visible / frame is None.
+        horizon_frac : road-top row / PROC_H  (0=top .. 1=bottom)
+        deviation    : baseline - horizon_frac (positive => road ends higher => uphill crest)
+        is_hill      : |deviation| > SLOPE_HILL_DEV
+        uphill       : deviation > 0
+
+    NOTE: single-frame heuristic; thresholds (SLOPE_HILL_DEV, ASPHALT_* ,
+    ROAD_ROW_THRESH) are first-pass and should be tuned against live runs.
+    """
+    if frame is None:
+        return None
+    small = cv2.resize(frame, (PROC_W, PROC_H))
+    hsv = cv2.cvtColor(small, cv2.COLOR_BGR2HSV)
+    s = hsv[:, :, 1]
+    v = hsv[:, :, 2]
+    asphalt = (s < ASPHALT_MAX_SAT) & (v > ASPHALT_MIN_VAL) & (v < ASPHALT_MAX_VAL)
+    x0 = int(PROC_W * SLOPE_CENTER_BAND[0])
+    x1 = int(PROC_W * SLOPE_CENTER_BAND[1])
+    row_frac = asphalt[:, x0:x1].mean(axis=1)          # fraction of asphalt per row, top->bottom
+
+    # Walk up from the bottom while rows keep reading as road, tolerating short
+    # gaps (lane dashes / bright markings break the asphalt run for a few rows).
+    road_top = PROC_H - 1
+    found = False
+    misses = 0
+    for r in range(PROC_H - 1, -1, -1):
+        if row_frac[r] > ROAD_ROW_THRESH:
+            road_top = r
+            found = True
+            misses = 0
+        elif found:
+            misses += 1
+            if misses > SLOPE_GAP_TOL:
+                break
+    if not found:
+        return None
+
+    horizon_frac = road_top / float(PROC_H)
+    base = _slope_state['baseline']
+    if base is None:
+        base = horizon_frac
+    deviation = base - horizon_frac
+    is_hill = abs(deviation) > SLOPE_HILL_DEV
+    if not is_hill:                                    # adapt baseline on flat frames only
+        base = (1.0 - SLOPE_EMA_ALPHA) * base + SLOPE_EMA_ALPHA * horizon_frac
+    _slope_state['baseline'] = base
+    return {
+        'horizon_frac': float(horizon_frac),
+        'deviation': float(deviation),
+        'is_hill': bool(is_hill),
+        'uphill': bool(deviation > 0),
+    }
 
 
 # ---------------------------------------------------------------------------

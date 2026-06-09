@@ -350,3 +350,61 @@ This was incorrect on three counts:
 6. Police visible in rear → `events=[POLICE]`; if a red is in front, `str` flips to steer **toward** the red.
 7. Scene dims → `events=[LOW_LIGHT]`, `acc` drops to `0.40`.
 8. Ctrl+C → "System terminated cleanly." within ~1 s.
+
+---
+
+## Phase 4 — Green-first priority + curve/hill awareness (current)
+
+### Why we changed
+This game build ships **no police vehicle and no trailing/overtaking car**, so
+the two rear-threat reactions that previously outranked the colour stack were
+dead weight. The objective is now plainly green-token collection (green count is
+the score driver), so green is promoted to the top of the steering stack.
+
+### Removed (documented for future reference)
+| Removed | Notes |
+| --- | --- |
+| **POLICE-SEEK MODE** | rear-cam blue + front red → steer *toward* the red. Code preserved in the `REMOVED` comment block above `_compute_steering` in `sample_drive.py`. |
+| **TRAILING-CAR FORCED SWERVE** | growing rear contour → fixed ±`LANE_CHANGE_STEER` swerve, alternating. `_lane_change_until` / `_lane_change_dir` timer deleted; constants `LANE_CHANGE_DURATION_S`, `LANE_CHANGE_STEER` kept in `image_detection.py`. |
+
+`detect_rear()` is still called so the REAR overlay panel renders, but it no
+longer feeds steering. To restore police/trailing behaviour: re-add the
+`_lane_change_*` timer and re-insert both branches at the **top** of
+`_compute_steering` (they are safety/penalty overrides and must outrank colours).
+
+### New steering priority (current)
+1. **GREEN seek** — *literal override*: green wins whenever visible
+   (`GREEN_ATTRACT_GAIN * cx + LANE_CURVE_GAIN * curve_bias`).
+2. **RED evade** — committed lane change away from red, with the 1.6 s latch +
+   0.35 s settle counter-steer.
+3. **YELLOW evade** — swerve away when centred & close.
+4. **Lane follow** — `LANE_GAIN * lane_offset + LANE_CURVE_GAIN * curve_bias`
+   (falls back to curve bias alone when no Hough lane lines are found).
+5. Default `0.0`.
+
+### Lane-curve awareness
+`detect_lane_curve()` now also returns `curve_bias ∈ [-1,+1]` (positive = bends
+right) and `lane_center_norm`. It fits `x = f(y)` over the warped sliding-window
+pixels and measures lane-centre drift from near→far. Blended into green-seek and
+lane-follow via `LANE_CURVE_GAIN = 0.4` so the car steers into bends early.
+
+### Hill awareness (`detect_slope`)
+New heuristic: walk up the centre-column asphalt band to find the road's top
+edge, track an EMA of the flat-road baseline, flag `is_hill` when the horizon
+deviates by `SLOPE_HILL_DEV`. On a hill:
+- **Throttle eased** to `HILL_THROTTLE = 0.5` ("don't accelerate" at the crest).
+- **Prepare for lane change** — red/yellow trigger areas scaled by
+  `HILL_AREA_SCALE = 0.5`, so evasion fires on smaller/closer orbs that crest
+  with little reaction distance.
+> Single-frame heuristic; `SLOPE_*`, `ASPHALT_*`, `ROAD_ROW_THRESH` are
+> first-pass and should be tuned against live runs.
+
+### Verification (Phase 4)
+1. `python sample_drive.py` → 4 "Started" lines, "Perception" + "Lane Curve" windows.
+2. GREEN visible (even with a RED nearby) → `str` biases toward green (literal override).
+3. RED in lane, no green → 1.6 s swerve + 0.35 s settle.
+4. YELLOW centred, no green/red → brief swerve away.
+5. Curved track → `str` anticipates the bend before the near lane offset moves.
+6. Crest → `events=[HILL]`, `acc` drops to `0.50`, evasion triggers on more distant orbs.
+7. Scene dims (flat) → `events=[LOW_LIGHT]`, `acc` `0.40`.
+8. Ctrl+C → "System terminated cleanly." within ~1 s.

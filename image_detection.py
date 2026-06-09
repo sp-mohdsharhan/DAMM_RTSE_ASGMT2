@@ -18,6 +18,10 @@ PUBLIC SURFACE (everything below is consumed by sample_drive.py):
     detect_front_objects(frame) -> dict
     detect_rear(frame)          -> dict
     detect_lane_offset(frame)   -> float | None
+    detect_lane_curve(frame)    -> dict | None   (CL0-CL2: bird's-eye + sliding-window;
+                                                  VISUALIZATION-ONLY for now, not consumed
+                                                  by the steering controller)
+    draw_lane_curve_debug(dbg)  -> ndarray | None (composite warp/mask/windows panel)
     detect_low_brightness(frame) -> bool        (poster: "low brightness" event)
     draw_overlay(front_per, rear_per, lane_offset, hud) -> ndarray
     calibrate_step(frame)       -> None         (autonomous HSV warm-up)
@@ -275,6 +279,225 @@ def detect_lane_offset(frame):
     else:
         lane_center = np.mean(right_x) - PROC_W * 0.25
     return (lane_center - PROC_W / 2.0) / (PROC_W / 2.0)
+
+
+# ---------------------------------------------------------------------------
+# Curve-aware lane detection (CL0-CL2): bird's-eye warp, lane-pixel mask,
+# sliding-window pixel search.
+#
+# STATUS: visualization-only. The steering controller still consumes
+# detect_lane_offset(). CL3 (polynomial fit + curvature) and CL4 (look-ahead
+# offset / heading error) will plug these pixel collections into a richer
+# struct in a later phase. See task0.md / plan.md.
+# ---------------------------------------------------------------------------
+
+# CL0 -- IPM (Inverse Perspective Mapping) constants.
+# Source quad picked on the working-resolution (PROC_W x PROC_H = 320 x 240)
+# frame. Trapezoid: narrow at the horizon (y ~= 0.58 * H, i.e. just below
+# FRONT_ROI_TOP_FRAC=0.28 + a margin to keep slopes safe) and wide at the
+# bottom. Numbers are first-pass; tune against screenshot/ before any
+# controller hook-up.
+IPM_SRC_PTS = np.float32([
+    [int(PROC_W * 0.10), PROC_H - 1],            # bottom-left
+    [int(PROC_W * 0.90), PROC_H - 1],            # bottom-right
+    [int(PROC_W * 0.60), int(PROC_H * 0.58)],    # top-right (horizon)
+    [int(PROC_W * 0.40), int(PROC_H * 0.58)],    # top-left  (horizon)
+])
+IPM_DST_W, IPM_DST_H = 200, 240
+IPM_DST_PTS = np.float32([
+    [0,           IPM_DST_H - 1],
+    [IPM_DST_W - 1, IPM_DST_H - 1],
+    [IPM_DST_W - 1, 0],
+    [0,           0],
+])
+
+# CL1 -- lane-pixel mask thresholds.
+LANE_SOBEL_KSIZE = 3
+LANE_SOBEL_THRESH = 40        # |Sobel-x| > this after normalize-to-255
+LANE_VALUE_THRESH = 150       # V (HSV) > this -> not asphalt
+
+# CL2 -- sliding window search.
+N_WINDOWS = 9
+WINDOW_MARGIN = 30            # half-width of each search window, in warped px
+MIN_WINDOW_PIX = 30           # min pixels to recenter the window
+HIST_BOTTOM_FRAC = 1.0 / 3.0  # use bottom 1/3 of mask for base-x histogram
+BASE_MIN_SEPARATION = 40      # px between left/right base picks
+
+# Cached perspective matrices (computed once).
+_IPM_M = None
+_IPM_MINV = None
+
+
+def _get_ipm_matrices():
+    """Return (M, Minv) for the perspective warp, computing once and caching."""
+    global _IPM_M, _IPM_MINV
+    if _IPM_M is None:
+        _IPM_M = cv2.getPerspectiveTransform(IPM_SRC_PTS, IPM_DST_PTS)
+        _IPM_MINV = cv2.getPerspectiveTransform(IPM_DST_PTS, IPM_SRC_PTS)
+    return _IPM_M, _IPM_MINV
+
+
+def _lane_pixel_mask(warp_bgr):
+    """CL1: cheap, lighting-tolerant binary mask of likely lane-marking pixels.
+
+    Combines two signals:
+      - Sobel-x on grayscale (vertical-ish edges -> lane markings appear
+        as bright edge pixels after warping)
+      - V channel from HSV thresholded high (filters out dark asphalt)
+    """
+    gray = cv2.cvtColor(warp_bgr, cv2.COLOR_BGR2GRAY)
+    gray = cv2.GaussianBlur(gray, (3, 3), 0)
+
+    sobel = cv2.Sobel(gray, cv2.CV_32F, 1, 0, ksize=LANE_SOBEL_KSIZE)
+    sobel = np.absolute(sobel)
+    smax = sobel.max() if sobel.size else 1.0
+    if smax < 1e-3:
+        sobel_u8 = np.zeros_like(gray, dtype=np.uint8)
+    else:
+        sobel_u8 = np.uint8(255.0 * sobel / smax)
+    edge_mask = cv2.inRange(sobel_u8, LANE_SOBEL_THRESH, 255)
+
+    hsv = cv2.cvtColor(warp_bgr, cv2.COLOR_BGR2HSV)
+    bright_mask = cv2.inRange(hsv[:, :, 2], LANE_VALUE_THRESH, 255)
+
+    mask = cv2.bitwise_or(edge_mask, bright_mask)
+    mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, np.ones((3, 3), np.uint8))
+    return mask
+
+
+def _histogram_base(mask):
+    """Return (left_base_x, right_base_x) or (None, None) using the bottom
+    HIST_BOTTOM_FRAC of the mask as a column-sum histogram."""
+    h = mask.shape[0]
+    y0 = int(h * (1.0 - HIST_BOTTOM_FRAC))
+    hist = mask[y0:, :].sum(axis=0)
+    if hist.max() == 0:
+        return None, None
+    midpoint = mask.shape[1] // 2
+    left_base = int(np.argmax(hist[:midpoint]))
+    right_rel = int(np.argmax(hist[midpoint:]))
+    right_base = midpoint + right_rel
+    # Require both peaks to actually carry signal and to be separated.
+    if hist[left_base] < MIN_WINDOW_PIX:
+        left_base = None
+    if hist[right_base] < MIN_WINDOW_PIX:
+        right_base = None
+    if (left_base is not None and right_base is not None
+            and (right_base - left_base) < BASE_MIN_SEPARATION):
+        # Two peaks too close -> probably the same rail; keep the stronger one.
+        if hist[left_base] >= hist[right_base]:
+            right_base = None
+        else:
+            left_base = None
+    return left_base, right_base
+
+
+def _sliding_window_collect(mask, base_x):
+    """Walk N_WINDOWS bottom-to-top from base_x, collecting nonzero pixel
+    coords inside each window. Returns (xs, ys, window_rects)."""
+    if base_x is None:
+        return np.empty(0, np.int32), np.empty(0, np.int32), []
+    h, w = mask.shape
+    win_h = h // N_WINDOWS
+    nonzero = mask.nonzero()
+    nz_y = nonzero[0]
+    nz_x = nonzero[1]
+    cur_x = int(base_x)
+    xs, ys = [], []
+    rects = []
+    for i in range(N_WINDOWS):
+        y_hi = h - i * win_h
+        y_lo = max(0, y_hi - win_h)
+        x_lo = max(0, cur_x - WINDOW_MARGIN)
+        x_hi = min(w, cur_x + WINDOW_MARGIN)
+        rects.append((x_lo, y_lo, x_hi, y_hi))
+        good = ((nz_y >= y_lo) & (nz_y < y_hi)
+                & (nz_x >= x_lo) & (nz_x < x_hi)).nonzero()[0]
+        if good.size > 0:
+            xs.append(nz_x[good])
+            ys.append(nz_y[good])
+            if good.size >= MIN_WINDOW_PIX:
+                cur_x = int(nz_x[good].mean())
+    if xs:
+        return np.concatenate(xs), np.concatenate(ys), rects
+    return np.empty(0, np.int32), np.empty(0, np.int32), rects
+
+
+def detect_lane_curve(frame):
+    """CL0-CL2 entry point. Visualization-only for now.
+
+    Returns dict with keys (or None if frame is None):
+        'warp'       : warped BGR (IPM_DST_H x IPM_DST_W x 3)
+        'mask'       : binary lane-pixel mask (same HxW as warp, uint8 0/255)
+        'left_pts'   : (xs, ys) ndarray pair of left-rail pixels in warp space
+        'right_pts'  : (xs, ys) ndarray pair of right-rail pixels in warp space
+        'left_rects' : list of (x_lo, y_lo, x_hi, y_hi) windows (for overlay)
+        'right_rects': same for right side
+        'left_base'  : seed x or None
+        'right_base' : seed x or None
+    """
+    if frame is None:
+        return None
+    small = cv2.resize(frame, (PROC_W, PROC_H))
+    M, _ = _get_ipm_matrices()
+    warp = cv2.warpPerspective(small, M, (IPM_DST_W, IPM_DST_H),
+                               flags=cv2.INTER_LINEAR)
+    mask = _lane_pixel_mask(warp)
+    left_base, right_base = _histogram_base(mask)
+    lx, ly, lrects = _sliding_window_collect(mask, left_base)
+    rx, ry, rrects = _sliding_window_collect(mask, right_base)
+    return {
+        'warp': warp,
+        'mask': mask,
+        'left_pts':  (lx, ly),
+        'right_pts': (rx, ry),
+        'left_rects':  lrects,
+        'right_rects': rrects,
+        'left_base':  left_base,
+        'right_base': right_base,
+    }
+
+
+def draw_lane_curve_debug(dbg):
+    """Composite debug panel: [warp | mask-as-BGR | warp-with-windows].
+    Returns None if dbg is None."""
+    if dbg is None:
+        return None
+    warp = dbg['warp']
+    mask = dbg['mask']
+    mask_bgr = cv2.cvtColor(mask, cv2.COLOR_GRAY2BGR)
+
+    annotated = warp.copy()
+    # Tint detected lane pixels: left=red, right=blue
+    lx, ly = dbg['left_pts']
+    rx, ry = dbg['right_pts']
+    if lx.size:
+        annotated[ly, lx] = (0, 0, 255)
+    if rx.size:
+        annotated[ry, rx] = (255, 0, 0)
+    # Draw sliding windows
+    for (x_lo, y_lo, x_hi, y_hi) in dbg['left_rects']:
+        cv2.rectangle(annotated, (x_lo, y_lo), (x_hi - 1, y_hi - 1), (0, 255, 0), 1)
+    for (x_lo, y_lo, x_hi, y_hi) in dbg['right_rects']:
+        cv2.rectangle(annotated, (x_lo, y_lo), (x_hi - 1, y_hi - 1), (0, 255, 255), 1)
+    # Base-x markers along the bottom row
+    if dbg['left_base'] is not None:
+        cv2.circle(annotated, (dbg['left_base'], IPM_DST_H - 4), 3, (0, 0, 255), -1)
+    if dbg['right_base'] is not None:
+        cv2.circle(annotated, (dbg['right_base'], IPM_DST_H - 4), 3, (255, 0, 0), -1)
+
+    gap = 6
+    panel = np.zeros((IPM_DST_H + 20, IPM_DST_W * 3 + gap * 2, 3), np.uint8)
+    panel[:IPM_DST_H, 0:IPM_DST_W] = warp
+    panel[:IPM_DST_H, IPM_DST_W + gap: IPM_DST_W * 2 + gap] = mask_bgr
+    panel[:IPM_DST_H, IPM_DST_W * 2 + gap * 2:] = annotated
+    cv2.putText(panel, "WARP", (4, IPM_DST_H + 14),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.4, (255, 255, 255), 1)
+    cv2.putText(panel, "MASK", (IPM_DST_W + gap + 4, IPM_DST_H + 14),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.4, (255, 255, 255), 1)
+    cv2.putText(panel, "WINDOWS", (IPM_DST_W * 2 + gap * 2 + 4, IPM_DST_H + 14),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.4, (255, 255, 255), 1)
+    return panel
 
 
 def detect_low_brightness(frame):

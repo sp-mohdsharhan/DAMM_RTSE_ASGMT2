@@ -7,7 +7,7 @@ import time
 #import keyboard
 import select
 import ctypes
-
+#  sharhan edit
 # Perception layer (HSV calibration, contour shape filters, lane offset,
 # brightness, overlay rendering) lives in image_detection.py. This module
 # owns the controller, RT scheduling glue, and the locked skeleton sections.
@@ -24,6 +24,7 @@ from image_detection import (
     RED_AVOID_GAIN, YELLOW_AVOID_GAIN, LANE_GAIN,
     # functions
     detect_front_objects, detect_rear, detect_lane_offset,
+    detect_lane_curve, draw_lane_curve_debug,
     detect_low_brightness, draw_overlay,
     calibrate_step, calibration_done,
 )
@@ -363,6 +364,13 @@ def processing_task():
         }
         overlay = draw_overlay(front_per, rear_per, lane_offset, hud)
         cv2.imshow("Perception", overlay)
+        # CL0-CL2 visualization-only debug window. Computed here so the
+        # steering pipeline above stays untouched. Cheap (~3-6 ms at 320x240).
+        if front_frame is not None:
+            curve_dbg = detect_lane_curve(front_frame)
+            curve_panel = draw_lane_curve_debug(curve_dbg)
+            if curve_panel is not None:
+                cv2.imshow("Lane Curve", curve_panel)
         cv2.waitKey(1)
     except Exception:
         pass

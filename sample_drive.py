@@ -25,6 +25,7 @@ from image_detection import (
     LANE_CURVE_GAIN, HILL_AREA_SCALE,
     ORB_ACT_DISTANCE, ORB_TIE_MARGIN,
     LANE_CHANGE_DURATION_S, LANE_CHANGE_STEER,
+    POLICE_DODGE_AREA, POLICE_DODGE_BAND,
     # functions
     detect_front_objects, detect_rear, detect_lane_offset,
     detect_lane_curve, draw_lane_curve_debug,
@@ -265,11 +266,11 @@ _lane_change_dir = 1
 # ---------------------------------------------------------------------------
 
 def _compute_steering(front_per, lane_offset, curve_bias, hill,
-                      police_seen=False, force_lane_change=False, swerve_dir=1):
-    """Steering. V2.0 rear-threat overrides first, then front-orb logic:
-       0a. POLICE behind (Ch.3) -> steer toward a RED token to escape; if no red
-           is visible, lane-change to dodge the police car (collision = game over).
-       0b. CHASING CAR behind (Ch.2) -> forced lane change to avoid the rear-end.
+                      force_lane_change=False, swerve_dir=1):
+    """Steering. V2.0 threat overrides first, then front-orb logic:
+       0a. POLICE ahead (Ch.3, FRONT) -> if it's close & centred, dodge the car
+           (collision = game over); otherwise grab a bright RED token to escape.
+       0b. CHASING CAR behind (Ch.2, REAR teal, growing) -> forced lane change.
        1.  IMMINENCE — nearest on-road orb (bird's-eye distance) wins if close:
            dodge red/yellow, grab green.
        2.  Fallback colour priority GREEN > RED > YELLOW; straight when empty.
@@ -282,13 +283,24 @@ def _compute_steering(front_per, lane_offset, curve_bias, hill,
     yellow = front_per['yellow'] if front_per else None
     orbs    = front_per.get('orbs', []) if front_per else []
     nearest = front_per.get('nearest') if front_per else None
+    police  = front_per.get('police') if front_per else None
 
-    # 0a) POLICE (Challenge 3): grab a red token to escape; else dodge the car.
-    if police_seen:
+    # 0a) POLICE ahead (Challenge 3) — collision = game over, so handle first.
+    if police is not None:
+        pcx = police['centroid_x_norm']
+        # Close & roughly centred -> dodge the car away from its side.
+        if police['area_frac'] > POLICE_DODGE_AREA and abs(pcx) < POLICE_DODGE_BAND:
+            return float(RED_AVOID_GAIN * (-1 if pcx >= 0 else 1))
+        # Otherwise grab a RED token to escape (bright red orb; the car's dark-red
+        # half is excluded from 'red' by the V floor, so we won't aim at the car).
         if red is not None:
-            return float(np.clip(RED_AVOID_GAIN * red['centroid_x_norm'], -1.0, 1.0))
-        return float(LANE_CHANGE_STEER * swerve_dir)
-    # 0b) CHASING CAR (Challenge 2): committed lane change away from the rear-end.
+            rcx = red['centroid_x_norm']
+            if abs(rcx) > GREEN_LANE_CHANGE_BAND:
+                return float(np.clip(GREEN_SEEK_GAIN * (1 if rcx > 0 else -1), -1.0, 1.0))
+            return float(np.clip(GREEN_ATTRACT_GAIN * rcx, -1.0, 1.0))
+        # Police present, not centred, no red in view -> ease away from it.
+        return float(0.5 * (-1 if pcx >= 0 else 1))
+    # 0b) CHASING CAR behind (Challenge 2): committed lane change away from the rear-end.
     if force_lane_change:
         return float(LANE_CHANGE_STEER * swerve_dir)
 
@@ -383,7 +395,7 @@ def processing_task():
     front_per   = detect_front_objects(front_frame)
     lane_offset = detect_lane_offset(front_frame)
     low_light   = detect_low_brightness(front_frame)
-    # Rear camera (V2.0): police (Ch.3) + chasing car (Ch.2).
+    # Rear camera (V2.0): chasing car (Ch.2). Police (Ch.3) is in front_per now.
     rear_per    = detect_rear(back_frame) if back_frame is not None else None
 
     # Lane-curve readout (also drives the "Lane Curve" debug window below, so we
@@ -405,8 +417,8 @@ def processing_task():
         _lane_change_until = now + LANE_CHANGE_DURATION_S
         _lane_change_dir = -_lane_change_dir
     force_lc = now < _lane_change_until
-    # Challenge 3 (V2.0): police present while the rear cam sees the police car.
-    police_seen = bool(rear_per and rear_per['police']['present'])
+    # Challenge 3 (V2.0): police car detected in the FRONT camera.
+    police_seen = bool(front_per and front_per.get('police'))
 
     # --- Challenge 1 (V2.0): LOW-LIGHT recovery ---
     # When the light goes out, brightness drops and all tokens become unknown
@@ -418,9 +430,9 @@ def processing_task():
         steering = 0.0
         accel = -1.0
     else:
-        # Steering: rear threats (police/chasing) override -> imminence -> colour priority.
+        # Steering: police(front)/chasing(rear) override -> imminence -> colour priority.
         steering = _compute_steering(front_per, lane_offset, curve_bias, hill,
-                                     police_seen, force_lc, _lane_change_dir)
+                                     force_lc, _lane_change_dir)
         accel = CRUISE_THROTTLE
 
     with state_lock:

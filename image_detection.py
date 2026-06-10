@@ -17,8 +17,8 @@ PUBLIC SURFACE (everything below is consumed by sample_drive.py):
     LANE_CURVE_GAIN, HILL_AREA_SCALE,
     LOW_BRIGHTNESS_THRESHOLD,
 - Functions:
-    detect_front_objects(frame) -> dict          (orbs + 'nearest' by bird's-eye distance)
-    detect_rear(frame)          -> dict          (V2.0: police + chasing car, rear camera)
+    detect_front_objects(frame) -> dict          (orbs + 'nearest' + 'police' (Ch.3, front))
+    detect_rear(frame)          -> dict          (V2.0 Ch.2: teal chasing car, rear camera)
     detect_lane_offset(frame)   -> float | None
     detect_lane_curve(frame)    -> dict | None   (CL0-CL2 bird's-eye + sliding-window for the
                                                   debug panel; also returns 'curve_bias' (-1..+1)
@@ -123,8 +123,10 @@ ROAD_ROW_THRESH = 0.20                   # fraction of center-band asphalt for a
 SLOPE_CENTER_BAND = (0.30, 0.70)         # center column fraction used to locate the road horizon
 SLOPE_GAP_TOL = 8                        # rows of non-road (lane dashes) tolerated before the road top
 
-# Low-brightness event detection (poster: "low brightness — turn light on or all tokens yellow")
-LOW_BRIGHTNESS_THRESHOLD = 50            # mean V channel below this -> consider it dim
+# Low-brightness event detection (V2.0 Challenge 1). Measured: normal driving
+# centre-crop mean V ~105-138; during the darkness event it drops to ~46-70.
+# Threshold 85 sits cleanly between the two bands so the event fires reliably.
+LOW_BRIGHTNESS_THRESHOLD = 85            # mean V channel below this -> dark (send accel=-1.0 to recover)
 
 
 # ---------------------------------------------------------------------------
@@ -154,13 +156,25 @@ HSV_YELLOW = (np.array([16, 100, 120]), np.array([32, 255, 255]))
 HSV_POLICE = (np.array([112, 210, 60]), np.array([135, 255, 255]))  # S>=210: police blue S~245 vs sky S~200
 REAR_SKY_FRAC = 0.35                      # ignore top 35% of the rear frame (sky/buildings)
 
+# Chasing car (V2.0 Challenge 2): the TEAL/cyan car. Measured H~86, S~190 (S/V vary
+# with lighting). Teal (H 78-98) is distinct from sky/buildings (H~120), police
+# blue (H 112-135), and every orb (green 57 / yellow 21 / red 175) — so pinning
+# it kills the "any saturated blob" false positives that fired on sky and orbs.
+HSV_CHASING = (np.array([78, 120, 40]), np.array([98, 255, 255]))
+
+# Police-car front avoidance (Challenge 3): if the police blob ahead is this big
+# and roughly centred, dodge it (collision = game over) instead of seeking a token.
+POLICE_DODGE_AREA = 0.04
+POLICE_DODGE_BAND = 0.50
+
 # Mutable active HSV ranges (list-of-(lo,hi) per color), consulted by detectors.
 # All orb colours are pinned (calibration off); police is pinned too.
 _hsv_active = {
     'red':    [HSV_RED_1, HSV_RED_2],
     'green':  [HSV_GREEN],
     'yellow': [HSV_YELLOW],
-    'police': [HSV_POLICE],
+    'police':  [HSV_POLICE],    # FRONT camera (Challenge 3)
+    'chasing': [HSV_CHASING],   # REAR camera (Challenge 2)
 }
 
 # --- Auto-calibration constants & state ---
@@ -336,6 +350,11 @@ def detect_front_objects(frame):
     def _nearest(lst):
         return min(lst, key=lambda o: o['distance']) if lst else None
 
+    # Police car ahead (Challenge 3): blue half (HSV_POLICE). It's a car, not an
+    # orb, so detect it as a blob. Its dark-red half (V~108) is below the red orb
+    # V floor (120) so it is NOT picked up as a grabbable red token.
+    police = _largest_blob(_color_mask(hsv, *_hsv_active['police']), roi_area, roi_x0)
+
     return {
         'frame': small,
         'roi_y0': roi_y0,
@@ -346,12 +365,15 @@ def detect_front_objects(frame):
         'yellow': _nearest(yellows),
         'orbs':    all_orbs,
         'nearest': all_orbs[0] if all_orbs else None,
+        'police':  police,
     }
 
 
-def _largest_blob(mask, roi_area, min_area_px=ORB_MIN_AREA_PX):
+def _largest_blob(mask, roi_area, roi_x0=0, min_area_px=ORB_MIN_AREA_PX):
     """Largest contour by area with only a minimal size gate (NO orb-shape
-    filter) — for rear vehicles (cars / police are not circular). Returns an
+    filter) — for cars (chasing car / police car are not circular). roi_x0 maps
+    a horizontally-cropped ROI back to full-frame x (same convention as orbs: x
+    is full-frame, y is ROI-relative so the overlay's y_offset works). Returns an
     info dict {bbox, circle, area_frac, centroid_x_norm, centroid_y} or None."""
     if mask is None:
         return None
@@ -364,9 +386,9 @@ def _largest_blob(mask, roi_area, min_area_px=ORB_MIN_AREA_PX):
     if best is None:
         return None
     x, y, w, h = cv2.boundingRect(best)
-    cx, cy = x + w / 2.0, y + h / 2.0
+    cx, cy = x + w / 2.0 + roi_x0, y + h / 2.0
     return {
-        'bbox': (int(x), int(y), int(w), int(h)),
+        'bbox': (int(x + roi_x0), int(y), int(w), int(h)),
         'circle': (int(cx), int(cy), int(np.sqrt(best_area / np.pi))),
         'area_frac': float(best_area) / float(roi_area),
         'centroid_x_norm': (cx - PROC_W / 2.0) / (PROC_W / 2.0),
@@ -379,33 +401,22 @@ _prev_other_area = 0.0
 
 
 def detect_rear(frame):
-    """Rear-camera threats for V2.0. Returns
-       {'frame', 'police': {'info', 'present'}, 'other_car': {'info', 'growing'}}.
-    - Challenge 3 POLICE: contour matching HSV_POLICE (colour is a PLACEHOLDER —
-      verify against a V2.0 screenshot).
-    - Challenge 2 CHASING CAR: largest saturated, bright, non-police blob whose
-      area is growing frame-over-frame (it's catching up).
-    Vehicles aren't circular, so this uses _largest_blob (no orb-shape filter)."""
+    """Rear-camera CHASING CAR (V2.0 Challenge 2). Returns
+       {'frame', 'other_car': {'info', 'growing'}}.
+    The chasing car is the TEAL car (HSV_CHASING) — pinning its colour means sky,
+    buildings, and rear-floating orbs no longer register as a car (the old
+    "any saturated blob" approach false-fired on all of them). 'growing' = its
+    area is increasing frame-over-frame (it's catching up). (Police is NOT here —
+    it appears in the FRONT camera; see detect_front_objects.)"""
     global _prev_other_area
     small = cv2.resize(frame, (PROC_W, PROC_H))
     roi_area = PROC_W * PROC_H
     hsv = cv2.cvtColor(small, cv2.COLOR_BGR2HSV)
-    sky_cut = int(PROC_H * REAR_SKY_FRAC)             # rows above this are sky/buildings
 
-    pol_mask = _color_mask(hsv, *_hsv_active['police'])
-    if pol_mask is not None:
-        pol_mask[:sky_cut, :] = 0                     # ignore blue sky/buildings
-    police_info = _largest_blob(pol_mask, roi_area)
-    police_present = police_info is not None and police_info['area_frac'] > 0.01
-
-    # Chasing car: saturated + bright blob that is NOT police-coloured.
-    veh = cv2.inRange(hsv[:, :, 1], 80, 255)
-    veh = cv2.bitwise_and(veh, cv2.inRange(hsv[:, :, 2], 40, 255))
-    if pol_mask is not None:
-        veh = cv2.bitwise_and(veh, cv2.bitwise_not(pol_mask))
-    veh[:sky_cut, :] = 0                              # ignore sky/buildings band
-    veh = cv2.morphologyEx(veh, cv2.MORPH_OPEN, np.ones((5, 5), np.uint8))
-    other = _largest_blob(veh, roi_area)
+    teal = _color_mask(hsv, *_hsv_active['chasing'])
+    if teal is not None:
+        teal = cv2.morphologyEx(teal, cv2.MORPH_OPEN, np.ones((5, 5), np.uint8))
+    other = _largest_blob(teal, roi_area)
     growing = False
     if other is not None:
         growing = other['area_frac'] > _prev_other_area + 0.005 and other['area_frac'] > 0.02
@@ -415,7 +426,6 @@ def detect_rear(frame):
 
     return {
         'frame': small,
-        'police': {'info': police_info, 'present': police_present},
         'other_car': {'info': other, 'growing': growing},
     }
 
@@ -857,6 +867,7 @@ def draw_overlay(front_per, rear_per, lane_offset, hud):
         _draw_obj(front_img, front_per['red'],    "RED",    (0, 0, 255), y0)
         _draw_obj(front_img, front_per['green'],  "GREEN",  (0, 255, 0), y0)
         _draw_obj(front_img, front_per['yellow'], "YELLOW", (0, 255, 255), y0)
+        _draw_obj(front_img, front_per.get('police'), "POLICE", (255, 0, 0), y0)  # Ch.3 (front)
         # Highlight the NEAREST orb (imminence target) with a white ring.
         near = front_per.get('nearest')
         if near is not None:
@@ -867,8 +878,7 @@ def draw_overlay(front_per, rear_per, lane_offset, hud):
             cv2.line(front_img, (PROC_W // 2, PROC_H - 5), (cx, PROC_H - 25), (255, 255, 255), 2)
 
     if rear_per:
-        _draw_obj(rear_img, rear_per['police']['info'],    "POLICE", (255, 0, 0))
-        _draw_obj(rear_img, rear_per['other_car']['info'], "CAR",    (200, 200, 0))
+        _draw_obj(rear_img, rear_per['other_car']['info'], "CAR", (0, 255, 255))  # teal chasing car (Ch.2)
 
     # HUD strip — front | rear panels
     hud_h = 60

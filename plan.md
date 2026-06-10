@@ -593,3 +593,40 @@ everything in processing_task (accel = -1.0).
 > **Needs a live run + V2.0 screenshot:** police colour (HSV_POLICE), and confirm
 > the chasing car reads as a saturated rear blob. Detection logic verified on
 > synthetic input; colours/thresholds are first-pass.
+
+---
+
+## Phase 12 — V2.0 fixes from gameplay analysis (recording 120026)
+
+A recorded V2.0 run showed all three challenges failing. Root causes found and
+fixed from measured frames:
+
+### Challenge 2 — chasing car was a constant false positive
+The rear "any saturated blob" detector fired every frame on blue sky/buildings
+and rear-floating orbs → nonstop phantom swerve (`str=±0.80`) that wrecked the run.
+**Fix:** the chasing car is the **TEAL car** (measured H~86, S~190). Pinned
+`HSV_CHASING = (78,120,40)-(98,255,255)`. Teal is distinct from sky (H~120),
+police blue (H 112-135) and every orb, so `detect_rear` now only fires on the real
+car. Verified: teal car detected, sky-only → None.
+
+### Challenge 3 — police is in the FRONT, not the rear
+My first cut detected police in the rear (never fired). Police is the **blue+red
+car ahead**. **Fix:** detect the blue half in `detect_front_objects` (`'police'`).
+Controller: if it's close & centred → **dodge** (collision = game over); else
+**seek a bright red token** to escape. The car's dark-red half (V~108) is below the
+red-token V floor (120), so it's not mistaken for a grabbable token. Removed police
+from `detect_rear`. Measured: police blue H125 S247; red half V108; red token V238.
+
+### Challenge 1 — low-light never triggered
+Measured: normal centre-crop mean V ~105-138, darkness event ~46-70. Old threshold
+50 sat inside the dark band (fired only intermittently). **Fix:**
+`LOW_BRIGHTNESS_THRESHOLD 50 -> 85` (clean gap). Already sends `accel=-1.0` to recover.
+
+### Steering priority (V2.0 final)
+0a POLICE ahead (dodge if centred-close, else grab red) · 0b CHASING car (teal,
+rear) → lane change · 1 imminence nearest-orb · 2 colour GREEN>RED>YELLOW · straight.
+Low-light recovery (accel=-1.0) overrides all in processing_task.
+
+> Still first-pass on a live run: POLICE_DODGE_AREA/BAND, chasing-car growth
+> threshold, and LOW_BRIGHTNESS_THRESHOLD=85 (screenshot-measured; confirm on the
+> real socket feed).

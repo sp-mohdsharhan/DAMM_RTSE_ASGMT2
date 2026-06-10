@@ -29,7 +29,7 @@ from image_detection import (
     # functions
     detect_front_objects, detect_rear, detect_lane_offset,
     detect_lane_curve, draw_lane_curve_debug,
-    detect_low_brightness, detect_slope, draw_overlay,
+    detect_low_brightness, scene_brightness_p90, detect_slope, draw_overlay,
     calibrate_step, calibration_done,
 )
 
@@ -451,6 +451,8 @@ def processing_task():
         near = front_per.get('nearest') if front_per else None
         if near is not None:
             events_visible.append(f"NEAR:{near['color'][0].upper()} d={near['distance']:.0f}")
+        # Live brightness readout (p90 V) for tuning the low-light trigger.
+        events_visible.append(f"BRI:{scene_brightness_p90(front_frame):.0f}")
         hud = {
             'target': accel * 100.0, 'eff': accel * 100.0,
             'police': police_seen, 'events': events_visible,

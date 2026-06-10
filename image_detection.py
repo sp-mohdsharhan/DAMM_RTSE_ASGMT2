@@ -123,12 +123,16 @@ ROAD_ROW_THRESH = 0.20                   # fraction of center-band asphalt for a
 SLOPE_CENTER_BAND = (0.30, 0.70)         # center column fraction used to locate the road horizon
 SLOPE_GAP_TOL = 8                        # rows of non-road (lane dashes) tolerated before the road top
 
-# Low-brightness event detection (V2.0 Challenge 1). True darkness dims the WHOLE
-# scene, so its 90th-percentile V is low (~49). The yellow-hit camera MALFUNCTION
-# instead paints black patches but leaves the visible parts bright (p90 ~187) — it
-# must NOT trigger the reverse-recovery. So we threshold the 90th percentile V (not
-# the mean, which both events lower): p90 < 90 => genuine uniform darkness.
-LOW_BRIGHTNESS_THRESHOLD = 90            # 90th-percentile V below this -> dark (send accel=-1.0 to recover)
+# Low-brightness event detection (V2.0 Challenge 1) — ADAPTIVE. The event is a
+# "brightness decrease", so we detect a relative DROP rather than trusting an
+# absolute value (the live feed's brightness isn't known a-priori). We track a
+# running baseline of the centre-crop 90th-percentile V over bright frames and
+# flag darkness when the current p90 falls below a fraction of it (or below a hard
+# absolute floor). p90 (not mean) keeps the yellow-hit camera MALFUNCTION out: its
+# black patches leave the visible parts bright, so p90 barely drops.
+LOW_BRIGHTNESS_DROP_FRAC = 0.65          # p90 < this * running-baseline -> dark
+LOW_BRIGHTNESS_THRESHOLD = 90            # OR absolute p90 below this -> dark (clear darkness)
+LOW_BRIGHTNESS_EMA = 0.04                # baseline adaptation rate (bright frames only)
 
 
 # ---------------------------------------------------------------------------
@@ -731,20 +735,40 @@ def draw_lane_curve_debug(dbg):
     return panel
 
 
-def detect_low_brightness(frame):
-    """True only for the V2.0 Challenge 1 darkness event (uniform low light).
+# Running baseline of the scene's bright-level (90th-pct V), adapted on bright
+# frames only so a sustained dark event can't drag it down.
+_brightness_baseline = {'p90': None}
 
-    Tests the 90th-percentile V of a centre crop, NOT the mean: genuine darkness
-    dims the whole scene (even the brightest pixels are dark -> low p90), whereas
-    the yellow-hit camera malfunction paints black rectangles but leaves the rest
-    bright (high p90). Using p90 means the malfunction's black patches don't drag
-    us into a false 'dark' reading (which would wrongly reverse the car)."""
+
+def scene_brightness_p90(frame):
+    """90th-percentile V of a centre crop (the scene's 'bright level'). Used for
+    both the low-light decision and the HUD readout."""
     if frame is None:
-        return False
+        return 255.0
     h, w = frame.shape[:2]
     crop = frame[h // 4: h * 3 // 4, w // 4: w * 3 // 4]
     v = cv2.cvtColor(crop, cv2.COLOR_BGR2HSV)[:, :, 2]
-    return float(np.percentile(v, 90)) < LOW_BRIGHTNESS_THRESHOLD
+    return float(np.percentile(v, 90))
+
+
+def detect_low_brightness(frame):
+    """True only for the V2.0 Challenge 1 darkness event (uniform brightness drop).
+
+    Adaptive: fire when the centre-crop p90 V falls below LOW_BRIGHTNESS_DROP_FRAC
+    of a running baseline (or below the absolute floor LOW_BRIGHTNESS_THRESHOLD).
+    Using p90 keeps the yellow-hit camera malfunction out (its visible parts stay
+    bright, so p90 barely drops). The baseline only adapts on non-dark frames."""
+    if frame is None:
+        return False
+    p90 = scene_brightness_p90(frame)
+    base = _brightness_baseline['p90']
+    if base is None or base < 1.0:
+        base = max(p90, 1.0)
+    dark = (p90 < base * LOW_BRIGHTNESS_DROP_FRAC) or (p90 < LOW_BRIGHTNESS_THRESHOLD)
+    if not dark:                                       # adapt baseline on bright frames only
+        base = (1.0 - LOW_BRIGHTNESS_EMA) * base + LOW_BRIGHTNESS_EMA * p90
+    _brightness_baseline['p90'] = base
+    return dark
 
 
 # ---------------------------------------------------------------------------

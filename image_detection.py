@@ -130,8 +130,12 @@ SLOPE_GAP_TOL = 8                        # rows of non-road (lane dashes) tolera
 # flag darkness when the current p90 falls below a fraction of it (or below a hard
 # absolute floor). p90 (not mean) keeps the yellow-hit camera MALFUNCTION out: its
 # black patches leave the visible parts bright, so p90 barely drops.
-LOW_BRIGHTNESS_DROP_FRAC = 0.65          # p90 < this * running-baseline -> dark
-LOW_BRIGHTNESS_THRESHOLD = 90            # OR absolute p90 below this -> dark (clear darkness)
+# Measured on the live feed (HUD BRI): normal p90 ~242, during the dim event ~192
+# (only a ~21% drop — the bright lane markings / sky highlights stay bright, so
+# p90 barely moves). DROP_FRAC 0.85 -> fires below ~206 at a 242 baseline: catches
+# the 192 dim with margin while normal (232-248) stays clear.
+LOW_BRIGHTNESS_DROP_FRAC = 0.85          # p90 < this * running-baseline -> dark
+LOW_BRIGHTNESS_THRESHOLD = 120           # OR absolute p90 below this -> dark (deep darkness backup)
 LOW_BRIGHTNESS_EMA = 0.04                # baseline adaptation rate (bright frames only)
 
 

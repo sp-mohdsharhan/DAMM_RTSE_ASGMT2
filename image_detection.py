@@ -123,10 +123,12 @@ ROAD_ROW_THRESH = 0.20                   # fraction of center-band asphalt for a
 SLOPE_CENTER_BAND = (0.30, 0.70)         # center column fraction used to locate the road horizon
 SLOPE_GAP_TOL = 8                        # rows of non-road (lane dashes) tolerated before the road top
 
-# Low-brightness event detection (V2.0 Challenge 1). Measured: normal driving
-# centre-crop mean V ~105-138; during the darkness event it drops to ~46-70.
-# Threshold 85 sits cleanly between the two bands so the event fires reliably.
-LOW_BRIGHTNESS_THRESHOLD = 85            # mean V channel below this -> dark (send accel=-1.0 to recover)
+# Low-brightness event detection (V2.0 Challenge 1). True darkness dims the WHOLE
+# scene, so its 90th-percentile V is low (~49). The yellow-hit camera MALFUNCTION
+# instead paints black patches but leaves the visible parts bright (p90 ~187) — it
+# must NOT trigger the reverse-recovery. So we threshold the 90th percentile V (not
+# the mean, which both events lower): p90 < 90 => genuine uniform darkness.
+LOW_BRIGHTNESS_THRESHOLD = 90            # 90th-percentile V below this -> dark (send accel=-1.0 to recover)
 
 
 # ---------------------------------------------------------------------------
@@ -730,14 +732,19 @@ def draw_lane_curve_debug(dbg):
 
 
 def detect_low_brightness(frame):
-    """True if the scene is dim (poster's 'low brightness' event).
-    Uses mean V on a centre crop so HUD overlays don't bias the result."""
+    """True only for the V2.0 Challenge 1 darkness event (uniform low light).
+
+    Tests the 90th-percentile V of a centre crop, NOT the mean: genuine darkness
+    dims the whole scene (even the brightest pixels are dark -> low p90), whereas
+    the yellow-hit camera malfunction paints black rectangles but leaves the rest
+    bright (high p90). Using p90 means the malfunction's black patches don't drag
+    us into a false 'dark' reading (which would wrongly reverse the car)."""
     if frame is None:
         return False
     h, w = frame.shape[:2]
     crop = frame[h // 4: h * 3 // 4, w // 4: w * 3 // 4]
-    hsv = cv2.cvtColor(crop, cv2.COLOR_BGR2HSV)
-    return float(hsv[:, :, 2].mean()) < LOW_BRIGHTNESS_THRESHOLD
+    v = cv2.cvtColor(crop, cv2.COLOR_BGR2HSV)[:, :, 2]
+    return float(np.percentile(v, 90)) < LOW_BRIGHTNESS_THRESHOLD
 
 
 # ---------------------------------------------------------------------------

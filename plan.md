@@ -630,3 +630,16 @@ Low-light recovery (accel=-1.0) overrides all in processing_task.
 > Still first-pass on a live run: POLICE_DODGE_AREA/BAND, chasing-car growth
 > threshold, and LOW_BRIGHTNESS_THRESHOLD=85 (screenshot-measured; confirm on the
 > real socket feed).
+
+---
+
+## Phase 13 — Low-light vs camera-malfunction discriminator
+
+The reverse-recovery (accel=-1.0) was at risk of false-firing on the yellow-hit
+**camera malfunction** (black patches), not just the genuine **low-light** event.
+Measured (centre crop): true darkness p90 V ~49 (whole scene uniformly dim);
+malfunction p90 V ~187 (black rectangles, but visible parts bright). Mean V lowers
+for both → unreliable. **Fix:** `detect_low_brightness` now thresholds the
+**90th-percentile V** (`< 90`), not the mean — fires only on uniform darkness.
+Verified: low-bright→True, malfunction→False, normal driving (p90 190-214)→False.
+So the car only reverses for the real Challenge 1 event.

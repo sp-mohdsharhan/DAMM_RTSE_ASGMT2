@@ -24,8 +24,9 @@ from image_detection import (
     RED_AVOID_GAIN, YELLOW_AVOID_GAIN, LANE_GAIN,
     LANE_CURVE_GAIN, HILL_AREA_SCALE,
     ORB_ACT_DISTANCE, ORB_TIE_MARGIN,
+    LANE_CHANGE_DURATION_S, LANE_CHANGE_STEER,
     # functions
-    detect_front_objects, detect_lane_offset,
+    detect_front_objects, detect_rear, detect_lane_offset,
     detect_lane_curve, draw_lane_curve_debug,
     detect_low_brightness, detect_slope, draw_overlay,
     calibrate_step, calibration_done,
@@ -57,9 +58,7 @@ shared_data = {
     'steering_cmd': 0.0,
     'accel_cmd': 0.0,
     'perception_front': {},
-    # 'latest_back_frame' is still drained by ReadBackCamera (prevents the game's
-    # back-camera socket from blocking) but no longer processed: police /
-    # car-behind detection was removed.
+    'perception_back': {},   # V2.0: rear police (Ch.3) + chasing car (Ch.2)
 }
 data_lock = threading.Lock()
 state_lock = threading.Lock()
@@ -250,38 +249,30 @@ _red_avoid = {'until': 0.0, 'settle_until': 0.0, 'dir': 0}
 # Green pursuit latch: a brief hold toward the green's lane so a green that
 # flickers / leaves the ROI mid-crossing still gets a completed lane change.
 _green_seek = {'until': 0.0, 'dir': 0}
+# Chasing-car forced-swerve latch (V2.0 Challenge 2): armed when a growing car is
+# seen behind; holds a fixed ±LANE_CHANGE_STEER for LANE_CHANGE_DURATION_S,
+# direction alternating each trigger.
+_lane_change_until = 0.0
+_lane_change_dir = 1
 
 # ---------------------------------------------------------------------------
-# REMOVED behaviours (kept here for future reference)
-# ---------------------------------------------------------------------------
-# This game build has no police vehicle and no trailing/overtaking car, so the
-# two rear-threat reactions that used to sit ABOVE the colour stack were removed:
-#
-#   * POLICE-SEEK MODE — when the rear camera saw police-blue and a red was
-#     ahead, steering inverted to drive TOWARD the red centroid
-#     (poster rule "catch the next red token or -50% speed"):
-#         if police_seen and red and red.area_frac > RED_AVOID_AREA_FRAC:
-#             return clip(RED_AVOID_GAIN * red.centroid_x_norm)
-#
-#   * TRAILING-CAR FORCED SWERVE — a rear contour growing frame-over-frame armed
-#     a fixed ±LANE_CHANGE_STEER swerve for LANE_CHANGE_DURATION_S, direction
-#     alternating each trigger (tracked via _lane_change_until / _lane_change_dir):
-#         if force_lane_change:
-#             return LANE_CHANGE_STEER * swerve_dir
-#
-# If a future build reintroduces police / trailing cars, restore detect_rear()
-# consumption in processing_task, re-add the _lane_change_* timer, and re-insert
-# these two branches at the TOP of _compute_steering (they are safety/penalty
-# overrides and must outrank the colour priorities below). The matching
-# constants (LANE_CHANGE_DURATION_S, LANE_CHANGE_STEER) still live in
-# image_detection.py.
+# V2.0 rear-threat handling (Challenges 2 & 3) — both live in the REAR camera.
+#   * Challenge 3 POLICE (detect_rear police): grab a RED token to escape;
+#     collision = game over -> highest priority.
+#   * Challenge 2 CHASING CAR (detect_rear other_car growing): forced lane
+#     change to avoid the rear-end (-50% speed).
+# Both outrank the front-orb logic (see _compute_steering steps 0a/0b).
 # ---------------------------------------------------------------------------
 
-def _compute_steering(front_per, lane_offset, curve_bias, hill):
-    """Imminence-first steering. The NEAREST on-road orb (bird's-eye distance)
-    wins if it's close enough to act on — dodge it if red/yellow, grab it if
-    green — otherwise fall back to colour priority GREEN > RED > YELLOW. Goes
-    straight when nothing is in view (no lane centering).
+def _compute_steering(front_per, lane_offset, curve_bias, hill,
+                      police_seen=False, force_lane_change=False, swerve_dir=1):
+    """Steering. V2.0 rear-threat overrides first, then front-orb logic:
+       0a. POLICE behind (Ch.3) -> steer toward a RED token to escape; if no red
+           is visible, lane-change to dodge the police car (collision = game over).
+       0b. CHASING CAR behind (Ch.2) -> forced lane change to avoid the rear-end.
+       1.  IMMINENCE — nearest on-road orb (bird's-eye distance) wins if close:
+           dodge red/yellow, grab green.
+       2.  Fallback colour priority GREEN > RED > YELLOW; straight when empty.
     On a hill the red/yellow trigger areas shrink (HILL_AREA_SCALE) so evasion
     fires earlier. (lane_offset is kept for the overlay's lane line, not steering.)
     """
@@ -291,6 +282,15 @@ def _compute_steering(front_per, lane_offset, curve_bias, hill):
     yellow = front_per['yellow'] if front_per else None
     orbs    = front_per.get('orbs', []) if front_per else []
     nearest = front_per.get('nearest') if front_per else None
+
+    # 0a) POLICE (Challenge 3): grab a red token to escape; else dodge the car.
+    if police_seen:
+        if red is not None:
+            return float(np.clip(RED_AVOID_GAIN * red['centroid_x_norm'], -1.0, 1.0))
+        return float(LANE_CHANGE_STEER * swerve_dir)
+    # 0b) CHASING CAR (Challenge 2): committed lane change away from the rear-end.
+    if force_lane_change:
+        return float(LANE_CHANGE_STEER * swerve_dir)
 
     # Hill: orbs crest into view late -> lower the trigger areas so we react sooner.
     red_area_thr    = RED_AVOID_AREA_FRAC    * (HILL_AREA_SCALE if hill else 1.0)
@@ -367,11 +367,10 @@ def _compute_steering(front_per, lane_offset, curve_bias, hill):
     return 0.0
 
 def processing_task():
-    # Snapshot the front frame under data_lock (fast), then release. The back
-    # camera is still drained by ReadBackCamera (keeps the game's socket from
-    # blocking) but is no longer processed — rear detection was removed.
+    # Snapshot front + back frames under data_lock (fast), then release.
     with data_lock:
         front_frame = shared_data['latest_front_frame']
+        back_frame = shared_data['latest_back_frame']
 
     if front_frame is None:
         return
@@ -380,10 +379,12 @@ def processing_task():
     if not calibration_done():
         calibrate_step(front_frame)
 
-    # Perception (lock-free) — front camera only.
+    # Perception (lock-free).
     front_per   = detect_front_objects(front_frame)
     lane_offset = detect_lane_offset(front_frame)
     low_light   = detect_low_brightness(front_frame)
+    # Rear camera (V2.0): police (Ch.3) + chasing car (Ch.2).
+    rear_per    = detect_rear(back_frame) if back_frame is not None else None
 
     # Lane-curve readout (also drives the "Lane Curve" debug window below, so we
     # compute it once here and reuse it). curve_bias anticipates the bend.
@@ -395,32 +396,55 @@ def processing_task():
     slope = detect_slope(front_frame)
     hill  = bool(slope and slope['is_hill'])
 
-    # Steering: imminence-first (nearest orb wins) -> fallback green>red>yellow; straight when empty.
-    steering = _compute_steering(front_per, lane_offset, curve_bias, hill)
+    now = time.monotonic()
+    # Challenge 2 (V2.0): arm a forced lane change when a rear car is growing
+    # (catching up). Arm only when not already swerving so one sustained reading
+    # doesn't pin steering; direction alternates each trigger.
+    global _lane_change_until, _lane_change_dir
+    if rear_per is not None and rear_per['other_car']['growing'] and now >= _lane_change_until:
+        _lane_change_until = now + LANE_CHANGE_DURATION_S
+        _lane_change_dir = -_lane_change_dir
+    force_lc = now < _lane_change_until
+    # Challenge 3 (V2.0): police present while the rear cam sees the police car.
+    police_seen = bool(rear_per and rear_per['police']['present'])
 
-    # Throttle: constant cruise, eased only under low brightness (degraded token
-    # visibility -> buy reaction time).
-    accel = LOW_BRIGHTNESS_THROTTLE if low_light else CRUISE_THROTTLE
+    # --- Challenge 1 (V2.0): LOW-LIGHT recovery ---
+    # When the light goes out, brightness drops and all tokens become unknown
+    # (colours corrupted), so detections can't be trusted. Per the rule, send
+    # acceleration_input = -1.0 to recover the light, and hold steering straight
+    # (any other control is penalised -10% while dark, and tokens are unreadable
+    # anyway). We keep sending -1.0 until brightness recovers.
+    if low_light:
+        steering = 0.0
+        accel = -1.0
+    else:
+        # Steering: rear threats (police/chasing) override -> imminence -> colour priority.
+        steering = _compute_steering(front_per, lane_offset, curve_bias, hill,
+                                     police_seen, force_lc, _lane_change_dir)
+        accel = CRUISE_THROTTLE
 
     with state_lock:
         shared_data['steering_cmd'] = steering
         shared_data['accel_cmd'] = accel
         shared_data['perception_front'] = front_per or {}
+        shared_data['perception_back'] = rear_per or {}
 
     # Overlay (own window; does NOT edit locked read_single_camera).
     try:
         events_visible = []
-        if hill:       events_visible.append('HILL')
-        if low_light:  events_visible.append('LOW_LIGHT')
+        if low_light:    events_visible.append('LOW_LIGHT->RECOVER')
+        if police_seen:  events_visible.append('POLICE->GRAB_RED')
+        if force_lc:     events_visible.append('CHASING_CAR')
+        if hill:         events_visible.append('HILL')
         near = front_per.get('nearest') if front_per else None
         if near is not None:
             events_visible.append(f"NEAR:{near['color'][0].upper()} d={near['distance']:.0f}")
         hud = {
             'target': accel * 100.0, 'eff': accel * 100.0,
-            'events': events_visible,
+            'police': police_seen, 'events': events_visible,
             'str': steering, 'acc': accel,
         }
-        overlay = draw_overlay(front_per, lane_offset, hud)
+        overlay = draw_overlay(front_per, rear_per, lane_offset, hud)
         cv2.imshow("Perception", overlay)
         # CL0-CL2 lane-curve debug window (reuses curve_dbg computed above).
         curve_panel = draw_lane_curve_debug(curve_dbg)
@@ -483,10 +507,9 @@ if __name__ == '__main__':
     #   SendControls   20ms  HIGH   - hard 50Hz actuator deadline; stale output = car drives blind.
     #   Processing     33ms  MEDIUM - the brain (perception -> steering/accel); above the rear
     #                                 camera so a slow rear frame can never starve it.
-    #   ReadBackCamera 50ms  LOW    - kept only to DRAIN the back socket so the game's
-    #                                 sender never blocks; rear perception was removed
-    #                                 (no police / trailing car in this build). Nothing
-    #                                 consumes its frames -> longest deadline, lowest priority.
+    #   ReadBackCamera 50ms  LOW    - V2.0 rear threats (police / chasing car) evolve
+    #                                 slowly: longest deadline -> lowest priority. Also
+    #                                 drains the back socket so the game's sender never blocks.
     t_front_camera = RTTask("ReadFrontCamera", period=0.005, priority=TaskPriority.HIGH,  execute_func=read_front_camera_task)
     t_back_camera  = RTTask("ReadBackCamera",  period=0.050, priority=TaskPriority.LOW,   execute_func=read_back_camera_task)
     t_processing   = RTTask("Processing",      period=0.033, priority=TaskPriority.MEDIUM, execute_func=processing_task)

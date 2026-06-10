@@ -17,16 +17,17 @@ PUBLIC SURFACE (everything below is consumed by sample_drive.py):
     LANE_CURVE_GAIN, HILL_AREA_SCALE,
     LOW_BRIGHTNESS_THRESHOLD,
 - Functions:
-    detect_front_objects(frame) -> dict
+    detect_front_objects(frame) -> dict          (orbs + 'nearest' by bird's-eye distance)
+    detect_rear(frame)          -> dict          (V2.0: police + chasing car, rear camera)
     detect_lane_offset(frame)   -> float | None
     detect_lane_curve(frame)    -> dict | None   (CL0-CL2 bird's-eye + sliding-window for the
                                                   debug panel; also returns 'curve_bias' (-1..+1)
                                                   consumed by the steering controller)
     draw_lane_curve_debug(dbg)  -> ndarray | None (composite warp/mask/windows panel)
-    detect_low_brightness(frame) -> bool        (poster: "low brightness" event)
+    detect_low_brightness(frame) -> bool        (V2.0 Challenge 1: low-light recovery)
     detect_slope(frame)         -> dict | None  (hill / pitch estimate; 'is_hill' drives
-                                                  throttle ease + earlier evasion)
-    draw_overlay(front_per, lane_offset, hud) -> ndarray
+                                                  earlier evasion)
+    draw_overlay(front_per, rear_per, lane_offset, hud) -> ndarray
     calibrate_step(frame)       -> None         (autonomous HSV warm-up)
     calibration_done()          -> bool
 """
@@ -144,13 +145,22 @@ HSV_GREEN = (np.array([48, 30, 130]),   np.array([66, 255, 255]))
 # dark #9D700C=H21,S236,V157. Hue ~21-26 (gold), bright & saturated. Yellow is PINNED.
 HSV_YELLOW = (np.array([16, 100, 120]), np.array([32, 255, 255]))
 
+# Police car colour (V2.0 Challenge 3, rear camera). The police car is the
+# red+blue split livery; the BLUE half is the reliable discriminator (red would
+# clash with red tokens / other cars). Measured from game rule/police.jpg:
+# blue half H~125-127, S~245, V~110. Range below covers it; teal cars (H~85) and
+# the sky (lower saturation) are excluded. The rear sky band is also masked off
+# (REAR_SKY_FRAC) so blue sky/buildings can't be read as police.
+HSV_POLICE = (np.array([112, 210, 60]), np.array([135, 255, 255]))  # S>=210: police blue S~245 vs sky S~200
+REAR_SKY_FRAC = 0.35                      # ignore top 35% of the rear frame (sky/buildings)
+
 # Mutable active HSV ranges (list-of-(lo,hi) per color), consulted by detectors.
-# Auto-calibration replaces entries it learns; buckets without samples keep defaults.
-# (Police-blue removed — this build has no police vehicle to detect.)
+# All orb colours are pinned (calibration off); police is pinned too.
 _hsv_active = {
     'red':    [HSV_RED_1, HSV_RED_2],
     'green':  [HSV_GREEN],
     'yellow': [HSV_YELLOW],
+    'police': [HSV_POLICE],
 }
 
 # --- Auto-calibration constants & state ---
@@ -336,6 +346,77 @@ def detect_front_objects(frame):
         'yellow': _nearest(yellows),
         'orbs':    all_orbs,
         'nearest': all_orbs[0] if all_orbs else None,
+    }
+
+
+def _largest_blob(mask, roi_area, min_area_px=ORB_MIN_AREA_PX):
+    """Largest contour by area with only a minimal size gate (NO orb-shape
+    filter) — for rear vehicles (cars / police are not circular). Returns an
+    info dict {bbox, circle, area_frac, centroid_x_norm, centroid_y} or None."""
+    if mask is None:
+        return None
+    contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    best, best_area = None, 0.0
+    for c in contours:
+        a = cv2.contourArea(c)
+        if a >= min_area_px and a > best_area:
+            best, best_area = c, a
+    if best is None:
+        return None
+    x, y, w, h = cv2.boundingRect(best)
+    cx, cy = x + w / 2.0, y + h / 2.0
+    return {
+        'bbox': (int(x), int(y), int(w), int(h)),
+        'circle': (int(cx), int(cy), int(np.sqrt(best_area / np.pi))),
+        'area_frac': float(best_area) / float(roi_area),
+        'centroid_x_norm': (cx - PROC_W / 2.0) / (PROC_W / 2.0),
+        'centroid_y': float(cy),
+    }
+
+
+# Chasing-car growth tracker (frame-over-frame area increase = approaching).
+_prev_other_area = 0.0
+
+
+def detect_rear(frame):
+    """Rear-camera threats for V2.0. Returns
+       {'frame', 'police': {'info', 'present'}, 'other_car': {'info', 'growing'}}.
+    - Challenge 3 POLICE: contour matching HSV_POLICE (colour is a PLACEHOLDER —
+      verify against a V2.0 screenshot).
+    - Challenge 2 CHASING CAR: largest saturated, bright, non-police blob whose
+      area is growing frame-over-frame (it's catching up).
+    Vehicles aren't circular, so this uses _largest_blob (no orb-shape filter)."""
+    global _prev_other_area
+    small = cv2.resize(frame, (PROC_W, PROC_H))
+    roi_area = PROC_W * PROC_H
+    hsv = cv2.cvtColor(small, cv2.COLOR_BGR2HSV)
+    sky_cut = int(PROC_H * REAR_SKY_FRAC)             # rows above this are sky/buildings
+
+    pol_mask = _color_mask(hsv, *_hsv_active['police'])
+    if pol_mask is not None:
+        pol_mask[:sky_cut, :] = 0                     # ignore blue sky/buildings
+    police_info = _largest_blob(pol_mask, roi_area)
+    police_present = police_info is not None and police_info['area_frac'] > 0.01
+
+    # Chasing car: saturated + bright blob that is NOT police-coloured.
+    veh = cv2.inRange(hsv[:, :, 1], 80, 255)
+    veh = cv2.bitwise_and(veh, cv2.inRange(hsv[:, :, 2], 40, 255))
+    if pol_mask is not None:
+        veh = cv2.bitwise_and(veh, cv2.bitwise_not(pol_mask))
+    veh[:sky_cut, :] = 0                              # ignore sky/buildings band
+    veh = cv2.morphologyEx(veh, cv2.MORPH_OPEN, np.ones((5, 5), np.uint8))
+    other = _largest_blob(veh, roi_area)
+    growing = False
+    if other is not None:
+        growing = other['area_frac'] > _prev_other_area + 0.005 and other['area_frac'] > 0.02
+        _prev_other_area = other['area_frac']
+    else:
+        _prev_other_area = 0.0
+
+    return {
+        'frame': small,
+        'police': {'info': police_info, 'present': police_present},
+        'other_car': {'info': other, 'growing': growing},
     }
 
 
@@ -763,10 +844,11 @@ def _draw_obj(img, info, label, color, y_offset=0):
     )
 
 
-def draw_overlay(front_per, lane_offset, hud):
-    """Front-only perception overlay. (Rear panel removed along with police /
-    car-behind detection — this build has neither.)"""
+def draw_overlay(front_per, rear_per, lane_offset, hud):
+    """Front + rear perception overlay. Rear panel shows V2.0 threats (police /
+    chasing car). rear_per may be None."""
     front_img = front_per['frame'].copy() if front_per else np.zeros((PROC_H, PROC_W, 3), np.uint8)
+    rear_img = rear_per['frame'].copy() if rear_per else np.zeros((PROC_H, PROC_W, 3), np.uint8)
 
     if front_per:
         y0 = front_per['roi_y0']
@@ -784,13 +866,20 @@ def draw_overlay(front_per, lane_offset, hud):
             cx = int(PROC_W / 2 + lane_offset * PROC_W / 2)
             cv2.line(front_img, (PROC_W // 2, PROC_H - 5), (cx, PROC_H - 25), (255, 255, 255), 2)
 
-    # HUD strip
+    if rear_per:
+        _draw_obj(rear_img, rear_per['police']['info'],    "POLICE", (255, 0, 0))
+        _draw_obj(rear_img, rear_per['other_car']['info'], "CAR",    (200, 200, 0))
+
+    # HUD strip — front | rear panels
     hud_h = 60
-    canvas = np.zeros((PROC_H + hud_h, PROC_W, 3), np.uint8)
+    canvas = np.zeros((PROC_H + hud_h, PROC_W * 2 + 10, 3), np.uint8)
     canvas[:PROC_H, :PROC_W] = front_img
+    canvas[:PROC_H, PROC_W + 10:] = rear_img
     cv2.putText(canvas, "FRONT", (5, 15), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1)
+    cv2.putText(canvas, "REAR",  (PROC_W + 15, 15), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1)
     cv2.putText(canvas,
-                f"target={hud['target']:.0f} eff={hud['eff']:.0f} events={hud['events']}",
+                f"target={hud['target']:.0f} eff={hud['eff']:.0f} police={int(hud.get('police', 0))} "
+                f"events={hud['events']}",
                 (5, PROC_H + 20), cv2.FONT_HERSHEY_SIMPLEX, 0.45, (0, 255, 255), 1)
     cv2.putText(canvas,
                 f"str={hud['str']:+.2f} acc={hud['acc']:+.2f}",

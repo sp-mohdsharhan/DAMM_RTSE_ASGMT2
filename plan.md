@@ -554,3 +554,42 @@ Detection is gated to the **asphalt** (`_road_region_mask`): measured asphalt is
 low-sat grey (S~0-75, V~60-100) → `ROAD_SAT_MAX` raised 70→85. Orbs (V>185) and
 grass (S~120) stay excluded; convex-hull fill bridges the holes orbs punch in the
 road so an orb's centroid still reads as on-road. ~65% ROI coverage on a test frame.
+
+---
+
+## Phase 11 — RTSE_Phase_1_V2.0 challenges (branch: feature/gameplay-v2-challenges)
+
+The new release adds three challenges; rear detection (removed in Phase 6) is
+restored for two of them.
+
+### Challenge 1 — Low Light
+Brightness drops + all tokens become unknown. `detect_low_brightness` already
+finds it; the controller now sends **`accel = -1.0`** (steering 0) to recover the
+light and holds it until brightness returns, ignoring the corrupted tokens.
+(Replaces the old "ease throttle to 0.4" behaviour.)
+
+### Challenge 2 — Chasing car (rear)
+`detect_rear` (restored) flags a growing non-police vehicle behind. Arms a
+forced lane change (`LANE_CHANGE_STEER` for `LANE_CHANGE_DURATION_S`, alternating
+direction) to avoid the rear-end (-50% speed). 1st appearance 10 s / 2nd 3 s are
+game-enforced; we just react to the growing car.
+
+### Challenge 3 — Police car (rear)
+`detect_rear` flags the police car (HSV_POLICE — **PLACEHOLDER blue, needs a
+V2.0 screenshot to tune**). While present, steer the FRONT toward a **red token**
+to escape (or lane-change to dodge if no red is visible). Collision = game over,
+so police is the top steering priority.
+
+### Steering priority (V2.0, _compute_steering)
+0a POLICE→grab red · 0b CHASING car→swerve · 1 imminence nearest-orb ·
+2 colour priority GREEN>RED>YELLOW · straight. Low-light recovery overrides
+everything in processing_task (accel = -1.0).
+
+### Restored / changed
+- `detect_rear`, `_largest_blob` (no orb-shape filter — cars aren't round),
+  `HSV_POLICE`, rear panel in `draw_overlay`, `perception_back`, the
+  `_lane_change_*` latch, and rear consumption in `processing_task`.
+
+> **Needs a live run + V2.0 screenshot:** police colour (HSV_POLICE), and confirm
+> the chasing car reads as a saturated rear blob. Detection logic verified on
+> synthetic input; colours/thresholds are first-pass.

@@ -69,6 +69,13 @@ ROAD_SAT_MAX = 85
 ROAD_VAL_MIN = 30
 ROAD_VAL_MAX = 185
 
+# Imminence-first nearest-orb (consumed by the controller in sample_drive.py).
+# Each orb gets a bird's-eye ground 'distance' (warp units, IPM_DST_H=240 tall;
+# smaller = nearer). The controller reacts to the nearest orb within ACT_DISTANCE
+# before falling back to colour priority.
+ORB_ACT_DISTANCE = 120.0                  # only override colour priority when nearest orb is within this
+ORB_TIE_MARGIN = 25.0                     # if a red/yellow is ~this close to the nearest, dodge it (safety > points)
+
 # Steering / lane-change thresholds (consumed by the controller in sample_drive.py).
 # No shadow-state thresholds (hit cooldown, event durations, cam-degrade periods, etc.)
 # live here — the game itself owns those rules; we just react to what we see.
@@ -199,28 +206,37 @@ def _road_region_mask(hsv):
     return cv2.dilate(filled, np.ones((9, 9), np.uint8))
 
 
-def _largest_contour_info(mask, roi_area, roi_x0=0, road_mask=None,
-                          max_area_frac=ORB_MAX_AREA_FRAC,
-                          min_aspect=ORB_MIN_ASPECT, max_aspect=ORB_MAX_ASPECT,
-                          min_circularity=ORB_MIN_CIRCULARITY,
-                          min_fill=ORB_MIN_FILL_RATIO):
-    """Return the largest orb-shaped contour, or None.
+def _ground_distance(px, py):
+    """Bird's-eye distance proxy for a full-frame image point (px, py): project
+    it through the IPM homography and return IPM_DST_H - warped_y (smaller =
+    nearer). Returns +inf for points above the horizon / off the road plane."""
+    M, _ = _get_ipm_matrices()
+    pt = np.array([[[float(px), float(py)]]], dtype=np.float32)
+    wy = float(cv2.perspectiveTransform(pt, M)[0, 0][1])
+    if wy < 0.0 or wy > IPM_DST_H:
+        return float('inf')
+    return float(IPM_DST_H - wy)
+
+
+def _orb_contours_info(mask, roi_area, roi_x0=0, roi_y0=0, road_mask=None,
+                       max_area_frac=ORB_MAX_AREA_FRAC,
+                       min_aspect=ORB_MIN_ASPECT, max_aspect=ORB_MAX_ASPECT,
+                       min_circularity=ORB_MIN_CIRCULARITY,
+                       min_fill=ORB_MIN_FILL_RATIO):
+    """Return a LIST of orb dicts (one per qualifying contour), or [].
     Shape filters (aspect, circularity, fill, max-area) reject grass strips /
-    road markings; the thresholds are parameterised so on-road detection can
-    relax them to accept big, close, oval orbs. If road_mask is given (ROI
-    coords), only contours whose centroid lies on the road are kept — that is
-    what keeps the relaxed thresholds safe from grass.
-    roi_x0 is added to bbox x and centroid for correct global coords when ROI is horizontally cropped.
+    road markings; road_mask (ROI coords) keeps only orbs whose centroid is on
+    the asphalt, which is what lets the thresholds relax for big/close/oval orbs.
+    Each dict carries a bird's-eye 'distance' (smaller = nearer) from projecting
+    the orb's ground-contact point. roi_x0 / roi_y0 map ROI coords back to the
+    full PROC_W x PROC_H frame.
     """
     if mask is None:
-        return None
+        return []
     contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-    if not contours:
-        return None
     rh = road_mask.shape[0] if road_mask is not None else 0
     rw = road_mask.shape[1] if road_mask is not None else 0
-    best = None
-    best_area = 0.0
+    out = []
     for c in contours:
         area = cv2.contourArea(c)
         if area < ORB_MIN_AREA_PX:
@@ -248,50 +264,36 @@ def _largest_contour_info(mask, roi_area, roi_x0=0, road_mask=None,
             cyr = min(rh - 1, max(0, int(y + h / 2.0)))
             if road_mask[cyr, cxr] == 0:
                 continue
-        if area > best_area:
-            best = (c, area, area_frac, x, y, w, h)
-            best_area = area
-    if best is None:
-        return None
-    _, area, area_frac, x, y, w, h = best
-    cx = x + w / 2.0 + roi_x0
-    cy = y + h / 2.0
-
-    # NEW: area-equivalent circle (tighter than minEnclosingCircle)
-
-    M = cv2.moments(c)
-
-    if M["m00"] > 0:
-        circle_x = M["m10"] / M["m00"]
-        circle_y = M["m01"] / M["m00"]
-    else:
-        circle_x = x + w / 2.0
-        circle_y = y + h / 2.0
-
-    radius = np.sqrt(area / np.pi)
-
-    return {
-        'bbox': (int(x + roi_x0), int(y), int(w), int(h)),
-
-        'circle': (
-            int(circle_x + roi_x0),
-            int(circle_y),
-            int(radius)
-        ),
-
-        'area_frac': area_frac,
-        'centroid_x_norm': (cx - PROC_W / 2.0) / (PROC_W / 2.0),  # -1..+1
-        'centroid_y': float(cy),
-    }
+        m = cv2.moments(c)
+        if m["m00"] > 0:
+            circle_x = m["m10"] / m["m00"]
+            circle_y = m["m01"] / m["m00"]
+        else:
+            circle_x = x + w / 2.0
+            circle_y = y + h / 2.0
+        cx = x + w / 2.0 + roi_x0
+        cy = y + h / 2.0
+        # Ground-contact point (bottom-centre) in full-frame coords -> bird's-eye distance.
+        dist = _ground_distance(x + w / 2.0 + roi_x0, y + h + roi_y0)
+        out.append({
+            'bbox': (int(x + roi_x0), int(y), int(w), int(h)),
+            'circle': (int(circle_x + roi_x0), int(circle_y), int(np.sqrt(area / np.pi))),
+            'area_frac': area_frac,
+            'centroid_x_norm': (cx - PROC_W / 2.0) / (PROC_W / 2.0),  # -1..+1
+            'centroid_y': float(cy),
+            'distance': dist,
+        })
+    return out
 
 
 def detect_front_objects(frame):
-    """Return dict {'frame','roi_y0','roi_x0','road_mask','red','green','yellow'}.
+    """Return dict {'frame','roi_y0','roi_x0','road_mask','red','green','yellow','orbs','nearest'}.
 
-    Orbs are detected ON the asphalt only: a road-region mask gates the colour
-    contours so grass shoulders can't masquerade as giant green orbs, which in
-    turn lets the shape gate relax to catch big, close, oval orbs. If the road
-    can't be found this frame, fall back to the strict (grass-safe) thresholds.
+    Orbs are detected ON the asphalt only (road-region mask gates the colour
+    contours). Per-colour entries ('red'/'green'/'yellow') are the NEAREST orb of
+    that colour by bird's-eye distance; 'orbs' is every on-road orb (all colours)
+    sorted nearest-first; 'nearest' is the closest overall. Falls back to strict
+    grass-safe thresholds if no road is found.
     """
     small = cv2.resize(frame, (PROC_W, PROC_H))
     roi_y0 = int(PROC_H * FRONT_ROI_TOP_FRAC)
@@ -311,18 +313,29 @@ def detect_front_objects(frame):
     else:
         gate = {}                                     # strict defaults (grass-safe)
 
-    def _find(color):
-        return _largest_contour_info(_color_mask(hsv, *_hsv_active[color]),
-                                     roi_area, roi_x0, **gate)
+    def _orbs(color):
+        lst = _orb_contours_info(_color_mask(hsv, *_hsv_active[color]),
+                                 roi_area, roi_x0, roi_y0, **gate)
+        for o in lst:
+            o['color'] = color
+        return lst
+
+    reds, greens, yellows = _orbs('red'), _orbs('green'), _orbs('yellow')
+    all_orbs = sorted(reds + greens + yellows, key=lambda o: o['distance'])
+
+    def _nearest(lst):
+        return min(lst, key=lambda o: o['distance']) if lst else None
 
     return {
         'frame': small,
         'roi_y0': roi_y0,
         'roi_x0': roi_x0,
         'road_mask': road,
-        'red':    _find('red'),
-        'green':  _find('green'),
-        'yellow': _find('yellow'),
+        'red':    _nearest(reds),
+        'green':  _nearest(greens),
+        'yellow': _nearest(yellows),
+        'orbs':    all_orbs,
+        'nearest': all_orbs[0] if all_orbs else None,
     }
 
 
@@ -762,6 +775,11 @@ def draw_overlay(front_per, lane_offset, hud):
         _draw_obj(front_img, front_per['red'],    "RED",    (0, 0, 255), y0)
         _draw_obj(front_img, front_per['green'],  "GREEN",  (0, 255, 0), y0)
         _draw_obj(front_img, front_per['yellow'], "YELLOW", (0, 255, 255), y0)
+        # Highlight the NEAREST orb (imminence target) with a white ring.
+        near = front_per.get('nearest')
+        if near is not None:
+            ncx, ncy, nr = near['circle']
+            cv2.circle(front_img, (ncx, ncy + y0), nr + 4, (255, 255, 255), 1)
         if lane_offset is not None:
             cx = int(PROC_W / 2 + lane_offset * PROC_W / 2)
             cv2.line(front_img, (PROC_W // 2, PROC_H - 5), (cx, PROC_H - 25), (255, 255, 255), 2)

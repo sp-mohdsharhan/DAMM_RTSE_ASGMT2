@@ -23,6 +23,7 @@ from image_detection import (
     GREEN_LANE_CHANGE_BAND, GREEN_SEEK_GAIN, GREEN_SEEK_HOLD_S,
     RED_AVOID_GAIN, YELLOW_AVOID_GAIN, LANE_GAIN,
     LANE_CURVE_GAIN, HILL_AREA_SCALE,
+    ORB_ACT_DISTANCE, ORB_TIE_MARGIN,
     # functions
     detect_front_objects, detect_lane_offset,
     detect_lane_curve, draw_lane_curve_debug,
@@ -277,11 +278,10 @@ _green_seek = {'until': 0.0, 'dir': 0}
 # ---------------------------------------------------------------------------
 
 def _compute_steering(front_per, lane_offset, curve_bias, hill):
-    """Steering priority (highest wins). Pure orb reaction — no lane centering;
-    the car goes straight when nothing is in view:
-       1. GREEN seek  — committed lane change toward green, then fine-track.
-       2. RED evade   — committed lane change AWAY from red (latch + flip + settle).
-       3. YELLOW evade— swerve away when centred & close.
+    """Imminence-first steering. The NEAREST on-road orb (bird's-eye distance)
+    wins if it's close enough to act on — dodge it if red/yellow, grab it if
+    green — otherwise fall back to colour priority GREEN > RED > YELLOW. Goes
+    straight when nothing is in view (no lane centering).
     On a hill the red/yellow trigger areas shrink (HILL_AREA_SCALE) so evasion
     fires earlier. (lane_offset is kept for the overlay's lane line, not steering.)
     """
@@ -289,11 +289,39 @@ def _compute_steering(front_per, lane_offset, curve_bias, hill):
     red    = front_per['red']    if front_per else None
     green  = front_per['green']  if front_per else None
     yellow = front_per['yellow'] if front_per else None
+    orbs    = front_per.get('orbs', []) if front_per else []
+    nearest = front_per.get('nearest') if front_per else None
 
     # Hill: orbs crest into view late -> lower the trigger areas so we react sooner.
     red_area_thr    = RED_AVOID_AREA_FRAC    * (HILL_AREA_SCALE if hill else 1.0)
     yellow_area_thr = YELLOW_AVOID_AREA_FRAC * (HILL_AREA_SCALE if hill else 1.0)
 
+    # 0) IMMINENCE — the nearest orb wins if it's close enough to act on.
+    if nearest is not None and nearest['distance'] < ORB_ACT_DISTANCE:
+        # Safety tie-break: if a red/yellow is ~as near as the nearest, dodge it
+        # (hazard avoidance beats grabbing a green that's only marginally closer).
+        hazards = [o for o in orbs if o['color'] in ('red', 'yellow')
+                   and o['distance'] <= nearest['distance'] + ORB_TIE_MARGIN]
+        target = min(hazards, key=lambda o: o['distance']) if hazards else nearest
+        cx = target['centroid_x_norm']
+        if target['color'] == 'red':
+            direction = -1 if cx >= 0 else 1
+            _red_avoid['until'] = now + RED_LANE_CHANGE_DURATION_S
+            _red_avoid['settle_until'] = _red_avoid['until'] + RED_SETTLE_DURATION_S
+            _red_avoid['dir'] = direction
+            return float(RED_AVOID_GAIN * direction)
+        if target['color'] == 'yellow':
+            return float(np.clip(-YELLOW_AVOID_GAIN * np.sign(cx or 1.0), -1, 1))
+        # green -> grab it (commit toward, then fine-track once lined up).
+        if abs(cx) > GREEN_LANE_CHANGE_BAND:
+            _green_seek['dir'] = 1 if cx > 0 else -1
+            _green_seek['until'] = now + GREEN_SEEK_HOLD_S
+            return float(np.clip(GREEN_SEEK_GAIN * _green_seek['dir']
+                                 + LANE_CURVE_GAIN * curve_bias, -1.0, 1.0))
+        _green_seek['until'] = 0.0
+        return float(np.clip(GREEN_ATTRACT_GAIN * cx + LANE_CURVE_GAIN * curve_bias, -1.0, 1.0))
+
+    # ===== Fallback colour priority (nothing close enough to be "imminent") =====
     # 1) GREEN seek — change lane toward green, then fine-track onto it.
     if green is not None and green['area_frac'] > GREEN_ATTRACT_MIN_AREA:
         cx = green['centroid_x_norm']
@@ -367,7 +395,7 @@ def processing_task():
     slope = detect_slope(front_frame)
     hill  = bool(slope and slope['is_hill'])
 
-    # Steering: green seek > red evade > yellow evade; go straight when nothing in view (no centering).
+    # Steering: imminence-first (nearest orb wins) -> fallback green>red>yellow; straight when empty.
     steering = _compute_steering(front_per, lane_offset, curve_bias, hill)
 
     # Throttle: constant cruise, eased only under low brightness (degraded token
@@ -384,6 +412,9 @@ def processing_task():
         events_visible = []
         if hill:       events_visible.append('HILL')
         if low_light:  events_visible.append('LOW_LIGHT')
+        near = front_per.get('nearest') if front_per else None
+        if near is not None:
+            events_visible.append(f"NEAR:{near['color'][0].upper()} d={near['distance']:.0f}")
         hud = {
             'target': accel * 100.0, 'eff': accel * 100.0,
             'events': events_visible,

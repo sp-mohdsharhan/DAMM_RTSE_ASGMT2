@@ -420,15 +420,16 @@ def processing_task():
     # Challenge 3 (V2.0): police car detected in the FRONT camera.
     police_seen = bool(front_per and front_per.get('police'))
 
-    # --- Challenge 1 (V2.0): LOW-LIGHT recovery ---
-    # When the light goes out, brightness drops and all tokens become unknown
-    # (colours corrupted), so detections can't be trusted. Per the rule, send
-    # acceleration_input = -1.0 to recover the light, and hold steering straight
-    # (any other control is penalised -10% while dark, and tokens are unreadable
-    # anyway). We keep sending -1.0 until brightness recovers.
+    # --- Camera-dark handling (V2.0) ---
+    # IMPORTANT: the Challenge 1 low-light dim is applied to the game's MAIN view
+    # only, NOT to the camera feed, so we can't see it here and can't trigger the
+    # acceleration_input=-1.0 recovery from camera input. What actually darkens the
+    # CAMERA is the yellow-hit camera CORRUPTION (black patches) — and there's no
+    # recovery for that. So when the camera reads dark we just RIDE IT OUT: hold
+    # straight at cruise (don't steer on garbage detections, and do NOT reverse).
     if low_light:
         steering = 0.0
-        accel = -1.0
+        accel = CRUISE_THROTTLE
     else:
         # Steering: police(front)/chasing(rear) override -> imminence -> colour priority.
         steering = _compute_steering(front_per, lane_offset, curve_bias, hill,
@@ -444,7 +445,7 @@ def processing_task():
     # Overlay (own window; does NOT edit locked read_single_camera).
     try:
         events_visible = []
-        if low_light:    events_visible.append('LOW_LIGHT->RECOVER')
+        if low_light:    events_visible.append('CAM_DARK->HOLD')  # camera corruption; ride it out (no reverse)
         if police_seen:  events_visible.append('POLICE->GRAB_RED')
         if force_lc:     events_visible.append('CHASING_CAR')
         if hill:         events_visible.append('HILL')

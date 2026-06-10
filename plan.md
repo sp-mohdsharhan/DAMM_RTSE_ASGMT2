@@ -643,3 +643,20 @@ for both → unreliable. **Fix:** `detect_low_brightness` now thresholds the
 **90th-percentile V** (`< 90`), not the mean — fires only on uniform darkness.
 Verified: low-bright→True, malfunction→False, normal driving (p90 190-214)→False.
 So the car only reverses for the real Challenge 1 event.
+
+---
+
+## Phase 14 — Low-light NOT in camera feed; stop the false reverse
+
+User confirmed (and the data agrees): the **Challenge 1 dim is applied to the
+game's MAIN view only, NOT the camera feed** — during the real first-10s dim
+window the camera BRI stayed ~242. So the dim is **undetectable from camera input**
+and the `accel=-1.0` recovery can't be triggered legitimately. What our detector
+was actually catching (BRI ~192) is the **yellow-hit camera CORRUPTION** (black
+patches), for which there is no recovery.
+
+So the reverse only ever fired on the corruption — pure harm. **Removed the
+reverse.** The camera-dark branch now just RIDES IT OUT: steering 0, accel =
+CRUISE (don't act on garbage detections, never reverse). HUD shows `CAM_DARK->HOLD`.
+`detect_low_brightness` is retained only to drive that hold-straight safety, not
+recovery. Challenge 1 is effectively unaddressable from our inputs.

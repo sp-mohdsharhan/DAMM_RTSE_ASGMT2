@@ -367,14 +367,26 @@ the score driver), so green is promoted to the top of the steering stack.
 | **POLICE-SEEK MODE** | rear-cam blue + front red → steer *toward* the red. Code preserved in the `REMOVED` comment block above `_compute_steering` in `sample_drive.py`. |
 | **TRAILING-CAR FORCED SWERVE** | growing rear contour → fixed ±`LANE_CHANGE_STEER` swerve, alternating. `_lane_change_until` / `_lane_change_dir` timer deleted; constants `LANE_CHANGE_DURATION_S`, `LANE_CHANGE_STEER` kept in `image_detection.py`. |
 
-`detect_rear()` is still called so the REAR overlay panel renders, but it no
-longer feeds steering. To restore police/trailing behaviour: re-add the
-`_lane_change_*` timer and re-insert both branches at the **top** of
-`_compute_steering` (they are safety/penalty overrides and must outrank colours).
+**`detect_rear()` has now been removed entirely** (function, police HSV +
+calibration bucket, other-car contour-growth tracking) along with the REAR
+overlay panel — the overlay is front-only. `ReadBackCamera` still runs at
+50 ms / LOW purely to **drain the back socket** so the game's sender can't block;
+nothing consumes its frames. To restore police/trailing behaviour: re-add
+`detect_rear()`, the `_lane_change_*` timer, the REAR panel, and re-insert both
+steering branches at the **top** of `_compute_steering` (they are safety/penalty
+overrides and must outrank colours).
 
 ### New steering priority (current)
-1. **GREEN seek** — *literal override*: green wins whenever visible
-   (`GREEN_ATTRACT_GAIN * cx + LANE_CURVE_GAIN * curve_bias`).
+1. **GREEN seek** — *literal override*: green wins whenever visible. **Committed
+   pursuit**, not a gentle pull: if the green sits off-centre
+   (`|cx| > GREEN_LANE_CHANGE_BAND = 0.12`, i.e. in another lane) we steer at
+   full `GREEN_SEEK_GAIN = 0.9` toward it and hold for `GREEN_SEEK_HOLD_S = 0.5 s`
+   so a green that flickers / leaves the ROI mid-crossing still completes the
+   lane change; once it lines up ahead we ease to a `GREEN_ATTRACT_GAIN * cx`
+   fine-track. (The original `0.6 * cx` P-term could never cross a lane: far
+   greens have a tiny centroid offset, so the car only turned when the green was
+   already dead-ahead — too late. Side ROI also narrowed `0.15 → 0.10` so
+   outer-lane greens stay in view.)
 2. **RED evade** — committed lane change away from red, with the 1.6 s latch +
    0.35 s settle counter-steer.
 3. **YELLOW evade** — swerve away when centred & close.
@@ -392,7 +404,6 @@ lane-follow via `LANE_CURVE_GAIN = 0.4` so the car steers into bends early.
 New heuristic: walk up the centre-column asphalt band to find the road's top
 edge, track an EMA of the flat-road baseline, flag `is_hill` when the horizon
 deviates by `SLOPE_HILL_DEV`. On a hill:
-- **Throttle eased** to `HILL_THROTTLE = 0.5` ("don't accelerate" at the crest).
 - **Prepare for lane change** — red/yellow trigger areas scaled by
   `HILL_AREA_SCALE = 0.5`, so evasion fires on smaller/closer orbs that crest
   with little reaction distance.
@@ -405,6 +416,141 @@ deviates by `SLOPE_HILL_DEV`. On a hill:
 3. RED in lane, no green → 1.6 s swerve + 0.35 s settle.
 4. YELLOW centred, no green/red → brief swerve away.
 5. Curved track → `str` anticipates the bend before the near lane offset moves.
-6. Crest → `events=[HILL]`, `acc` drops to `0.50`, evasion triggers on more distant orbs.
+6. Crest → `events=[HILL]`, `acc` unchanged (no slow-down), evasion triggers on more distant orbs.
 7. Scene dims (flat) → `events=[LOW_LIGHT]`, `acc` `0.40`.
 8. Ctrl+C → "System terminated cleanly." within ~1 s.
+
+---
+
+## Phase 5 — Keep-LEFT home-lane strategy (current)
+
+### Why we changed
+Green-first (Phase 4) chased greens across every lane and weaved. We switched to
+a **stable keep-left policy**: the far-left lane is "home"; the car rides it and
+only makes small left/right moves around it. (Mirror of the earlier keep-right
+trial — flip every sign / side to switch home edges.)
+
+### Strategy (supersedes the Phase 4 priority stack)
+Priority in `_compute_steering` (highest wins):
+1. **RED dodge-RIGHT** — red ahead *in our path* (`-RED_AVOID_BAND_FRAC < cx < EVADE_RIGHT_IGNORE`)
+   → commit a full right swerve (`+RED_AVOID_GAIN`) for `RED_LANE_CHANGE_DURATION_S`,
+   then a settle phase that hands back to the home-left steer. We always dodge
+   **right** — riding the left edge leaves no room to the left. Reds clearly in a
+   **right** lane (`cx ≥ EVADE_RIGHT_IGNORE`) are ignored (not our path).
+2. **GREEN seek** — only if **reachable from the left** (`cx < GREEN_REACH_RIGHT`);
+   greens further right are ignored (won't cross right for them). Reachable green one
+   lane over → commit toward it, then home pulls back left.
+3. **YELLOW dodge-RIGHT** — same gating as red, fixed `+YELLOW_AVOID_GAIN`.
+4. **HOME (keep-left)** — `LEFT_LANE_BIAS + LANE_GAIN*lane_offset + LANE_CURVE_GAIN*curve_bias`.
+   The lane-follow term is feedback: the car settles left-of-centre and the bias
+   sets how far left.
+
+### New constants (`image_detection.py`)
+- `LEFT_LANE_BIAS = -0.35` — constant leftward steer (the keep-left knob; negative = left).
+- `GREEN_REACH_RIGHT = 0.35` — how far right we'll reach for a green (~one lane).
+- `EVADE_RIGHT_IGNORE = 0.25` — reds/yellows further right than this are off-path, ignored.
+
+> **Tuning caveat:** a *constant* bias hugs the left side of the **current** lane
+> via lane-follow equilibrium. To migrate fully to the far-left lane the bias must
+> be strong enough to cross lanes until the left road-edge line holds it. If it
+> won't reach the edge, make `LEFT_LANE_BIAS` more negative or switch to explicit
+> left-edge detection (deferred). Needs live tuning, like the rest of Phase 4/5.
+
+### Verification (Phase 5)
+1. Empty road → `str` ≈ `LEFT_LANE_BIAS` (negative), car drifts to and holds the far-left lane.
+2. RED ahead in our lane → hard **right** swerve, then drifts back left.
+3. RED in a right lane → ignored, car stays left.
+4. GREEN one lane to the right → brief right reach onto it, then back left.
+5. GREEN far right → ignored, car stays left.
+6. YELLOW ahead → brief right dodge, then back left.
+
+---
+
+## Phase 6 — Drop the home-lane hug (current)
+
+After a recorded run the keep-left hug pinned the car to the left curb
+(`str≈-0.90` sustained). Removed the home-lane bias entirely: the car now
+**centres in its lane** and reacts to orbs symmetrically.
+
+- Removed constants `LEFT_LANE_BIAS`, `GREEN_REACH_RIGHT`, `EVADE_RIGHT_IGNORE`
+  (and their imports). To restore a hug, re-add per Phase 5.
+- `_compute_steering` priority (unchanged order, bias removed):
+  1. **RED evade** — committed lane change *away* from red (latch + direction-flip + settle).
+  2. **GREEN seek** — committed lane change toward green (both directions), then fine-track.
+  3. **YELLOW evade** — swerve away when centred & close.
+  4. **HOME** — `LANE_GAIN*lane_offset + LANE_CURVE_GAIN*curve_bias` (centres in lane).
+
+---
+
+## Phase 7 — On-road, oval-tolerant orb detection (current)
+
+A recorded run showed big **close** orbs were missed: `ORB_MAX_AREA_FRAC = 0.07`
+discarded any orb that filled >7% of the ROI (i.e. the close orbs about to be
+hit), and the strict circularity/fill gate dropped perspective-squashed ovals.
+That cap existed to stop green **grass** shoulders being read as giant green
+orbs. Fix: gate detection to the **asphalt region** so grass is excluded by
+*location*, which lets the shape gate relax.
+
+- `_road_region_mask(hsv)` — largest low-saturation (asphalt) blob → convex-hull
+  fill → modest dilation. Orbs are kept only if their centroid lies on this mask.
+- Relaxed ON-ROAD thresholds (`ORB_ROAD_*`): area cap `0.45`, circularity `0.45`,
+  fill `0.55`, aspect `0.45–2.10` → big, close, **oval** orbs now pass.
+- `_largest_contour_info` parameterised (thresholds + `road_mask`); falls back to
+  the strict grass-safe defaults when no road is found that frame.
+- **Decision:** off-road orbs (e.g. greens on the grass shoulder) are *ignored*
+  by design — the car stays on track. Only on-road orbs are chased/avoided.
+
+### Grass-as-green fix (data-backed, from recording 095741)
+A second recording still showed grass detected as green. Sampling the frame:
+grass green is **H~60, S~120, V~65** — squarely inside the old green range
+(`V>60`), while real orbs are **V>180**. Green-hued pixels are cleanly bimodal
+(grass V<90, orbs V>180, the 90–150 band empty). Root cause: auto-calibration's
+sampling gate (`S>80 & V>60`) ingested dark grass as a "green" colour and learned
+a contaminated range. Fixes:
+- `HSV_GREEN` value floor `60 → 110`.
+- `calibrate_step` sampling gate value floor `60 → 110` (don't learn dark
+  grass/trees as a colour).
+Result: grass green pixels on the test frame dropped 2316 → 59; bright on-road
+orbs still detected.
+
+> Validation note: offline tests on recorded frames use *default* HSV (the live
+> pipeline auto-calibrates), so colour matches aren't representative — the
+> road-gating geometry is. Needs a live run to confirm + tune `ROAD_*` / `ORB_ROAD_*`.
+>
+> Gray-orb (yellow-hit "corrupted camera" debuff) detection — when orbs desaturate
+> and colour is unreadable — is a deferred follow-up: a colour-agnostic blob-on-road
+> detector could still localise them (but couldn't tell red from green).
+
+---
+
+## Phase 8 — Green-first, no lane centering (current)
+
+- **Priority reordered** to **GREEN seek > RED evade > YELLOW evade** (green is
+  literal override again — wins whenever a green is in view, even over a red).
+- **Lane centering removed.** The HOME stage (`LANE_GAIN*lane_offset + curve`) is
+  gone; when no orb is in view the controller returns **0.0 (go straight)**.
+  `lane_offset` is still computed for the overlay's lane line, not for steering.
+- Verified: empty view → 0.0; green+red → green wins; red+yellow → red wins.
+
+> Trade-off: with no centering the car only steers for orbs, so on a sharp bend
+> with no orbs it will run straight. Re-add the HOME stage (Phase 6) if it drifts
+> off-road on empty curves.
+
+---
+
+## Phase 9 — Pinned sprite colours + calibration off (current)
+
+All three orb colours measured from the sprites and **pinned** (auto-calibration
+fully disabled — `_calib_state['done']=True`, `_HUE_BUCKETS=[]`, calibrate_step
+never runs). More robust than calibration, which kept getting grass-contaminated.
+
+| Colour | OpenCV HSV range (lo → hi) | Source shades |
+|---|---|---|
+| GREEN  | (48,30,130) → (66,255,255) | #BDF3B5 #87E27E #5AB853 (H~57, V>180) |
+| RED    | (0,60,120)→(8,…) + (168,60,120)→(179,…) | #F9ACB9 #E66179 #C12742 (H~175) |
+| YELLOW | (16,100,120) → (32,255,255) | #FEEA75 #DFA214 #9D700C (H~21-26) |
+
+Detection is gated to the **asphalt** (`_road_region_mask`): measured asphalt is
+low-sat grey (S~0-75, V~60-100) → `ROAD_SAT_MAX` raised 70→85. Orbs (V>185) and
+grass (S~120) stay excluded; convex-hull fill bridges the holes orbs punch in the
+road so an orb's centroid still reads as on-road. ~65% ROI coverage on a test frame.

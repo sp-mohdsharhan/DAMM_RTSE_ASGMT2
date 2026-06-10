@@ -12,12 +12,12 @@ PUBLIC SURFACE (everything below is consumed by sample_drive.py):
     YELLOW_AVOID_AREA_FRAC, CENTER_BAND_FRAC,
     LANE_CHANGE_DURATION_S, LANE_CHANGE_STEER,
     GREEN_ATTRACT_GAIN, GREEN_ATTRACT_MIN_AREA,
+    GREEN_LANE_CHANGE_BAND, GREEN_SEEK_GAIN, GREEN_SEEK_HOLD_S,
     RED_AVOID_GAIN, YELLOW_AVOID_GAIN, LANE_GAIN,
     LANE_CURVE_GAIN, HILL_AREA_SCALE,
     LOW_BRIGHTNESS_THRESHOLD,
 - Functions:
     detect_front_objects(frame) -> dict
-    detect_rear(frame)          -> dict
     detect_lane_offset(frame)   -> float | None
     detect_lane_curve(frame)    -> dict | None   (CL0-CL2 bird's-eye + sliding-window for the
                                                   debug panel; also returns 'curve_bias' (-1..+1)
@@ -26,7 +26,7 @@ PUBLIC SURFACE (everything below is consumed by sample_drive.py):
     detect_low_brightness(frame) -> bool        (poster: "low brightness" event)
     detect_slope(frame)         -> dict | None  (hill / pitch estimate; 'is_hill' drives
                                                   throttle ease + earlier evasion)
-    draw_overlay(front_per, rear_per, lane_offset, hud) -> ndarray
+    draw_overlay(front_per, lane_offset, hud) -> ndarray
     calibrate_step(frame)       -> None         (autonomous HSV warm-up)
     calibration_done()          -> bool
 """
@@ -40,7 +40,9 @@ import numpy as np
 # ---------------------------------------------------------------------------
 PROC_W, PROC_H = 320, 240                # working resolution for perception
 FRONT_ROI_TOP_FRAC = 0.28                # ignore top 28%: keep horizon margin for uphill/downhill slopes
-FRONT_ROI_SIDE_FRAC = 0.15               # ignore leftmost/rightmost 15% (grass shoulders)
+FRONT_ROI_SIDE_FRAC = 0.10               # ignore leftmost/rightmost 10% (grass shoulders); was 0.15,
+                                         # narrowed so side-lane orbs (esp. green to chase) stay in view.
+                                         # Shape filters below still reject grass strips that leak in.
 
 # Orb-shape filters (reject grass strips, road markings, curb dashes, etc.)
 ORB_MAX_AREA_FRAC = 0.07                 # anything larger than this is environment
@@ -49,6 +51,23 @@ ORB_MIN_ASPECT = 0.70                    # near-square only (rejects dash rectan
 ORB_MAX_ASPECT = 1.45
 ORB_MIN_CIRCULARITY = 0.60               # 4*pi*A/P^2 — true orbs ~0.75+, dashes <0.5
 ORB_MIN_FILL_RATIO = 0.65                # area / bbox_area; circles fill ~0.78, dashes <0.5
+
+# Relaxed gate for ON-ROAD orbs. Once detection is restricted to the asphalt
+# region (grass is excluded by the road mask, not by strict shape rules), we can
+# accept the big, close, perspective-squashed OVAL orbs that the strict gate
+# above used to reject — these are exactly the close orbs about to be hit.
+ORB_ROAD_MAX_AREA_FRAC = 0.45            # allow large close orbs (was 0.07 -> dropped them)
+ORB_ROAD_MIN_ASPECT = 0.45              # accept ovals (taller-than-wide)
+ORB_ROAD_MAX_ASPECT = 2.10              # accept ovals (wider-than-tall)
+ORB_ROAD_MIN_CIRCULARITY = 0.45         # ellipses score lower than circles
+ORB_ROAD_MIN_FILL_RATIO = 0.55          # ellipse fills its bbox a bit less than a circle
+
+# Road-region mask thresholds (asphalt = low-saturation grey).
+# Measured asphalt: S~0-75, V~60-100. SAT_MAX 85 captures near-road (S~75) while
+# orbs (bright, V>185 -> excluded by VAL_MAX) and grass (S~120) stay out.
+ROAD_SAT_MAX = 85
+ROAD_VAL_MIN = 30
+ROAD_VAL_MAX = 185
 
 # Steering / lane-change thresholds (consumed by the controller in sample_drive.py).
 # No shadow-state thresholds (hit cooldown, event durations, cam-degrade periods, etc.)
@@ -62,8 +81,17 @@ CENTER_BAND_FRAC = 0.55                  # |x_norm| < this counts as "in path"
 LANE_CHANGE_DURATION_S = 1.5             # trailing-car defensive swerve
 LANE_CHANGE_STEER = 0.8
 
-GREEN_ATTRACT_GAIN = 0.6                 # pull toward green; green is now steering priority #1
-GREEN_ATTRACT_MIN_AREA = 0.005           # ignore tiny far-away greens (false attractors)
+GREEN_ATTRACT_GAIN = 0.6                 # fine-track gain once green is lined up ahead
+GREEN_ATTRACT_MIN_AREA = 0.004           # act on greens a touch earlier (commit the lane change in time)
+# Green pursuit: a gentle proportional pull can't cross a lane for an
+# adjacent-lane green (far greens have a tiny centroid offset). So commit to a
+# full-strength steer toward any green sitting clearly off-centre (= another
+# lane), hold briefly to finish the crossing, then fall back to fine-tracking.
+GREEN_LANE_CHANGE_BAND = 0.12            # |centroid_x_norm| above this => green is in another lane -> commit
+GREEN_SEEK_GAIN = 0.9                    # committed steer magnitude toward an off-lane green
+GREEN_SEEK_HOLD_S = 0.5                  # bridge frames where green flickers / leaves ROI mid-cross
+# (Keep-LEFT / keep-RIGHT home-lane bias removed — the car now centres in the
+#  lane and reacts to orbs. See plan.md Phase 5 to restore a home-lane hug.)
 RED_AVOID_GAIN = 1.0                     # full-lock swerve when red is in path
 YELLOW_AVOID_GAIN = 0.9
 LANE_GAIN = 0.6
@@ -95,19 +123,27 @@ LOW_BRIGHTNESS_THRESHOLD = 50            # mean V channel below this -> consider
 # HSV ranges & auto-calibration state
 # ---------------------------------------------------------------------------
 # OpenCV: H:0-179, S:0-255, V:0-255
-HSV_RED_1 = (np.array([0, 120, 80]),    np.array([10, 255, 255]))
-HSV_RED_2 = (np.array([170, 120, 80]),  np.array([179, 255, 255]))
-HSV_GREEN = (np.array([40, 80, 60]),    np.array([85, 255, 255]))
-HSV_YELLOW = (np.array([20, 120, 120]), np.array([35, 255, 255]))
-HSV_POLICE_BLUE = (np.array([100, 120, 60]), np.array([130, 255, 255]))
+# Red orb sprite colours (measured): light #F9ACB9=H175,S79,V249; mid #E66179=H175,S147,V230;
+# dark #C12742=H175,S203,V193. Hue pinned ~175 (high wraparound side), always BRIGHT (V>=193).
+# Red is PINNED (excluded from auto-calibration). Two sub-ranges keep the hue wraparound safe.
+HSV_RED_1 = (np.array([0, 60, 120]),    np.array([8, 255, 255]))    # low-side wraparound spill
+HSV_RED_2 = (np.array([168, 60, 120]),  np.array([179, 255, 255]))  # main orb red (~H175)
+# Green orb sprite colours (measured): light #BDF3B5=H56,S65,V243; mid #87E27E=H57,S113,V226;
+# dark #5AB853=H58,S140,V184. Tight hue ~56-58, always BRIGHT (V>=184); grass is dark (V~65).
+# Range below covers all three with margin and still excludes grass via the V floor.
+# Green is PINNED (excluded from auto-calibration) so this measured range is what's used.
+HSV_GREEN = (np.array([48, 30, 130]),   np.array([66, 255, 255]))
+# Yellow/gold orb sprite colours (measured): light #FEEA75=H26,S138,V254; mid #DFA214=H21,S232,V223;
+# dark #9D700C=H21,S236,V157. Hue ~21-26 (gold), bright & saturated. Yellow is PINNED.
+HSV_YELLOW = (np.array([16, 100, 120]), np.array([32, 255, 255]))
 
 # Mutable active HSV ranges (list-of-(lo,hi) per color), consulted by detectors.
 # Auto-calibration replaces entries it learns; buckets without samples keep defaults.
+# (Police-blue removed — this build has no police vehicle to detect.)
 _hsv_active = {
     'red':    [HSV_RED_1, HSV_RED_2],
     'green':  [HSV_GREEN],
     'yellow': [HSV_YELLOW],
-    'police': [HSV_POLICE_BLUE],
 }
 
 # --- Auto-calibration constants & state ---
@@ -116,16 +152,14 @@ CALIB_KMEANS_K = 6
 CALIB_MIN_PIXELS = 200
 CALIB_SUBSAMPLE = 5000
 HSV_MARGIN = np.array([10, 60, 60], dtype=np.int16)
-_HUE_BUCKETS = [
-    ('red',    [(0, 12), (168, 179)]),
-    ('yellow', [(18, 36)]),
-    ('green',  [(38, 88)]),
-    ('police', [(95, 135)]),
-]
+# All three orb colours are now PINNED to measured sprite ranges (HSV_GREEN /
+# HSV_RED_* / HSV_YELLOW), so auto-calibration is fully disabled: done=True from
+# the start and no hue buckets to learn, so calibrate_step() is never invoked.
+_HUE_BUCKETS = []
 _calib_state = {
     'frames_seen': 0,
-    'samples': {'red': [], 'green': [], 'yellow': [], 'police': []},
-    'done': False,
+    'samples': {},
+    'done': True,
 }
 
 
@@ -142,9 +176,40 @@ def _color_mask(hsv, *ranges):
     return mask
 
 
-def _largest_contour_info(mask, roi_area, roi_x0=0):
+def _road_region_mask(hsv):
+    """Filled mask (ROI coords) of the drivable road region, used to gate orb
+    detection so only orbs sitting ON the asphalt count (grass excluded).
+    Asphalt is low-saturation grey; a morphological close + convex-hull fill
+    bridge the holes punched by lane markings and the orbs themselves; a final
+    dilation lets orbs straddling the road edge still qualify. None if no road."""
+    s = hsv[:, :, 1]
+    v = hsv[:, :, 2]
+    road = ((s < ROAD_SAT_MAX) & (v > ROAD_VAL_MIN) & (v < ROAD_VAL_MAX)).astype(np.uint8) * 255
+    road = cv2.morphologyEx(road, cv2.MORPH_CLOSE, np.ones((9, 9), np.uint8))
+    contours, _ = cv2.findContours(road, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    if not contours:
+        return None
+    biggest = max(contours, key=cv2.contourArea)
+    if cv2.contourArea(biggest) < 0.05 * road.shape[0] * road.shape[1]:
+        return None                                   # no plausible road visible
+    filled = np.zeros_like(road)
+    cv2.drawContours(filled, [cv2.convexHull(biggest)], -1, 255, -1)
+    # Modest dilation: lets an orb straddling a lane-edge still count, without
+    # bleeding the gate out onto the grass shoulder (we want off-road orbs excluded).
+    return cv2.dilate(filled, np.ones((9, 9), np.uint8))
+
+
+def _largest_contour_info(mask, roi_area, roi_x0=0, road_mask=None,
+                          max_area_frac=ORB_MAX_AREA_FRAC,
+                          min_aspect=ORB_MIN_ASPECT, max_aspect=ORB_MAX_ASPECT,
+                          min_circularity=ORB_MIN_CIRCULARITY,
+                          min_fill=ORB_MIN_FILL_RATIO):
     """Return the largest orb-shaped contour, or None.
-    Filters out grass strips / road markings via aspect ratio, circularity, max-area cap, fill ratio.
+    Shape filters (aspect, circularity, fill, max-area) reject grass strips /
+    road markings; the thresholds are parameterised so on-road detection can
+    relax them to accept big, close, oval orbs. If road_mask is given (ROI
+    coords), only contours whose centroid lies on the road are kept — that is
+    what keeps the relaxed thresholds safe from grass.
     roi_x0 is added to bbox x and centroid for correct global coords when ROI is horizontally cropped.
     """
     if mask is None:
@@ -152,6 +217,8 @@ def _largest_contour_info(mask, roi_area, roi_x0=0):
     contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
     if not contours:
         return None
+    rh = road_mask.shape[0] if road_mask is not None else 0
+    rw = road_mask.shape[1] if road_mask is not None else 0
     best = None
     best_area = 0.0
     for c in contours:
@@ -159,23 +226,28 @@ def _largest_contour_info(mask, roi_area, roi_x0=0):
         if area < ORB_MIN_AREA_PX:
             continue
         area_frac = float(area) / float(roi_area)
-        if area_frac > ORB_MAX_AREA_FRAC:
+        if area_frac > max_area_frac:
             continue                                  # too big -> environment
         x, y, w, h = cv2.boundingRect(c)
         if h == 0:
             continue
         aspect = w / float(h)
-        if aspect < ORB_MIN_ASPECT or aspect > ORB_MAX_ASPECT:
+        if aspect < min_aspect or aspect > max_aspect:
             continue                                  # too elongated -> grass strip
         perim = cv2.arcLength(c, True)
         if perim <= 0:
             continue
         circularity = 4.0 * np.pi * area / (perim * perim)
-        if circularity < ORB_MIN_CIRCULARITY:
+        if circularity < min_circularity:
             continue                                  # not blob-like
         bbox_area = float(w * h)
-        if bbox_area <= 0 or (area / bbox_area) < ORB_MIN_FILL_RATIO:
+        if bbox_area <= 0 or (area / bbox_area) < min_fill:
             continue                                  # sparse/hollow (dashed stripe)
+        if road_mask is not None:                     # must sit ON the road
+            cxr = min(rw - 1, max(0, int(x + w / 2.0)))
+            cyr = min(rh - 1, max(0, int(y + h / 2.0)))
+            if road_mask[cyr, cxr] == 0:
+                continue
         if area > best_area:
             best = (c, area, area_frac, x, y, w, h)
             best_area = area
@@ -214,7 +286,13 @@ def _largest_contour_info(mask, roi_area, roi_x0=0):
 
 
 def detect_front_objects(frame):
-    """Return dict {'frame','roi_y0','roi_x0','red','green','yellow'}."""
+    """Return dict {'frame','roi_y0','roi_x0','road_mask','red','green','yellow'}.
+
+    Orbs are detected ON the asphalt only: a road-region mask gates the colour
+    contours so grass shoulders can't masquerade as giant green orbs, which in
+    turn lets the shape gate relax to catch big, close, oval orbs. If the road
+    can't be found this frame, fall back to the strict (grass-safe) thresholds.
+    """
     small = cv2.resize(frame, (PROC_W, PROC_H))
     roi_y0 = int(PROC_H * FRONT_ROI_TOP_FRAC)
     roi_x0 = int(PROC_W * FRONT_ROI_SIDE_FRAC)
@@ -222,50 +300,29 @@ def detect_front_objects(frame):
     roi = small[roi_y0:, roi_x0:roi_x1]
     roi_area = roi.shape[0] * roi.shape[1]
     hsv = cv2.cvtColor(roi, cv2.COLOR_BGR2HSV)
+    road = _road_region_mask(hsv)
+
+    if road is not None:
+        gate = dict(road_mask=road,
+                    max_area_frac=ORB_ROAD_MAX_AREA_FRAC,
+                    min_aspect=ORB_ROAD_MIN_ASPECT, max_aspect=ORB_ROAD_MAX_ASPECT,
+                    min_circularity=ORB_ROAD_MIN_CIRCULARITY,
+                    min_fill=ORB_ROAD_MIN_FILL_RATIO)
+    else:
+        gate = {}                                     # strict defaults (grass-safe)
+
+    def _find(color):
+        return _largest_contour_info(_color_mask(hsv, *_hsv_active[color]),
+                                     roi_area, roi_x0, **gate)
+
     return {
         'frame': small,
         'roi_y0': roi_y0,
         'roi_x0': roi_x0,
-        'red':    _largest_contour_info(_color_mask(hsv, *_hsv_active['red']), roi_area, roi_x0),
-        'green':  _largest_contour_info(_color_mask(hsv, *_hsv_active['green']), roi_area, roi_x0),
-        'yellow': _largest_contour_info(_color_mask(hsv, *_hsv_active['yellow']), roi_area, roi_x0),
-    }
-
-
-_prev_other_area = 0.0
-
-
-def detect_rear(frame):
-    """Return dict {'frame','police':{...},'other_car':{...}}."""
-    global _prev_other_area
-    small = cv2.resize(frame, (PROC_W, PROC_H))
-    roi_area = PROC_W * PROC_H
-    hsv = cv2.cvtColor(small, cv2.COLOR_BGR2HSV)
-
-    police_info = _largest_contour_info(_color_mask(hsv, *_hsv_active['police']), roi_area)
-    police_present = police_info is not None and police_info['area_frac'] > 0.01
-
-    # Other car: high-saturation contour that is NOT police-blue.
-    sat = hsv[:, :, 1]
-    val = hsv[:, :, 2]
-    veh_mask = cv2.inRange(sat, 80, 255)
-    veh_mask = cv2.bitwise_and(veh_mask, cv2.inRange(val, 40, 255))
-    police_mask = _color_mask(hsv, *_hsv_active['police'])
-    if police_mask is not None:
-        veh_mask = cv2.bitwise_and(veh_mask, cv2.bitwise_not(police_mask))
-    veh_mask = cv2.morphologyEx(veh_mask, cv2.MORPH_OPEN, np.ones((5, 5), np.uint8))
-    other = _largest_contour_info(veh_mask, roi_area)
-    growing = False
-    if other is not None:
-        growing = other['area_frac'] > _prev_other_area + 0.005 and other['area_frac'] > 0.02
-        _prev_other_area = other['area_frac']
-    else:
-        _prev_other_area = 0.0
-
-    return {
-        'frame': small,
-        'police': {'info': police_info, 'present': police_present},
-        'other_car': {'info': other, 'growing': growing},
+        'road_mask': road,
+        'red':    _find('red'),
+        'green':  _find('green'),
+        'yellow': _find('yellow'),
     }
 
 
@@ -693,9 +750,10 @@ def _draw_obj(img, info, label, color, y_offset=0):
     )
 
 
-def draw_overlay(front_per, rear_per, lane_offset, hud):
+def draw_overlay(front_per, lane_offset, hud):
+    """Front-only perception overlay. (Rear panel removed along with police /
+    car-behind detection — this build has neither.)"""
     front_img = front_per['frame'].copy() if front_per else np.zeros((PROC_H, PROC_W, 3), np.uint8)
-    rear_img = rear_per['frame'].copy() if rear_per else np.zeros((PROC_H, PROC_W, 3), np.uint8)
 
     if front_per:
         y0 = front_per['roi_y0']
@@ -708,20 +766,13 @@ def draw_overlay(front_per, rear_per, lane_offset, hud):
             cx = int(PROC_W / 2 + lane_offset * PROC_W / 2)
             cv2.line(front_img, (PROC_W // 2, PROC_H - 5), (cx, PROC_H - 25), (255, 255, 255), 2)
 
-    if rear_per:
-        _draw_obj(rear_img, rear_per['police']['info'],    "POLICE", (255, 0, 0))
-        _draw_obj(rear_img, rear_per['other_car']['info'], "CAR",    (200, 200, 0))
-
     # HUD strip
     hud_h = 60
-    canvas = np.zeros((PROC_H + hud_h, PROC_W * 2 + 10, 3), np.uint8)
+    canvas = np.zeros((PROC_H + hud_h, PROC_W, 3), np.uint8)
     canvas[:PROC_H, :PROC_W] = front_img
-    canvas[:PROC_H, PROC_W + 10:] = rear_img
     cv2.putText(canvas, "FRONT", (5, 15), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1)
-    cv2.putText(canvas, "REAR",  (PROC_W + 15, 15), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1)
     cv2.putText(canvas,
-                f"target={hud['target']:.0f} eff={hud['eff']:.0f} police={int(hud['police'])} "
-                f"events={hud['events']}",
+                f"target={hud['target']:.0f} eff={hud['eff']:.0f} events={hud['events']}",
                 (5, PROC_H + 20), cv2.FONT_HERSHEY_SIMPLEX, 0.45, (0, 255, 255), 1)
     cv2.putText(canvas,
                 f"str={hud['str']:+.2f} acc={hud['acc']:+.2f}",
@@ -748,8 +799,10 @@ def calibrate_step(frame):
     small = cv2.resize(frame, (PROC_W, PROC_H))
     roi = small[int(PROC_H * FRONT_ROI_TOP_FRAC):, :]
     hsv = cv2.cvtColor(roi, cv2.COLOR_BGR2HSV)
-    # Keep only saturated, bright pixels (ignore road/sky/dark)
-    mask = (hsv[:, :, 1] > 80) & (hsv[:, :, 2] > 60)
+    # Keep only saturated, BRIGHT pixels. V floor raised 60 -> 110 so dark grass /
+    # trees (green-hued but V~65) are NOT sampled as a colour — orbs are bright
+    # (V>180). This was the root cause of grass being learned into the green range.
+    mask = (hsv[:, :, 1] > 80) & (hsv[:, :, 2] > 110)
     pixels = hsv[mask]
     _calib_state['frames_seen'] += 1
     if len(pixels) >= CALIB_MIN_PIXELS:

@@ -31,7 +31,7 @@ from image_detection import (
 
 # Controller-policy throttle constants (NOT perception — live here).
 CRUISE_THROTTLE = 0.8                    # normal forward cruise
-LOW_BRIGHTNESS_THROTTLE = 0.4            # ease off when scene is dim (tokens may be invisible / all-yellow)
+LOW_BRIGHTNESS_THROTTLE = -1.0           # recover lighting when tokens become invisible in low-light conditions
 
 
 # ---------------------------------------------------------
@@ -341,8 +341,7 @@ def processing_task():
     # Steering: pure reaction to perception.
     steering = _compute_steering(front_per, lane_offset, force_lc, _lane_change_dir, police_seen)
 
-    # Throttle: constant cruise. Eased back under low brightness (token visibility
-    # is degraded, so accept the speed cost in exchange for more reaction time).
+    # Throttle: cruise normally; trigger low-light recovery when brightness drops.
     accel = LOW_BRIGHTNESS_THROTTLE if low_light else CRUISE_THROTTLE
 
     with state_lock:

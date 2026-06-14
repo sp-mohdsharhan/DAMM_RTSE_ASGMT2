@@ -35,7 +35,7 @@ from image_detection import (
 
 # Controller-policy throttle constants (NOT perception — live here).
 CRUISE_THROTTLE = 0.8                    # normal forward cruise
-LOW_BRIGHTNESS_THROTTLE = 0.4            # ease off when scene is dim (tokens may be invisible / all-yellow)
+LOW_BRIGHTNESS_THROTTLE = -1.0           # recover lighting when tokens become invisible in low-light conditions
 
 
 # ---------------------------------------------------------

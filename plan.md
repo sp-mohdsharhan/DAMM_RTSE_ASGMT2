@@ -1,5 +1,21 @@
 # Plan: OpenCV Auto-Detection for SpeedTrials2D (RTSE Competition)
 
+> **Current status: Phase 14 + Task 1 next.** The active controller is a
+> pure-perception V2.0 driver. The Unity simulator is the authoritative state
+> machine; our code does not track score, hit cooldowns, yellow-event state,
+> target speed, or police-active state in parallel.
+>
+> **Important:** Phases 1-13 are retained as design history. Some older sections
+> still say "current" because they were current at the time they were written.
+> For implementation decisions, use the newest phase at the bottom of this file,
+> `task1.md`, `sample_drive.py`, and `image_detection.py`.
+>
+> Current behaviour: front camera detects red/green/yellow tokens and the front
+> police car; rear camera detects only the teal chasing car; camera-dark/
+> corruption holds straight at cruise and must not reverse. The next planned
+> improvement is confidence gating plus temporal confirmation so weak/flickering
+> detections do not reach steering.
+
 > **⚠ Status (Phase 3, current):** the shadow-state event engine described in Phases 1–2
 > below has been **removed**. The official rules poster (`game rule/RTSE_Poster_game.pdf`)
 > confirms the Unity simulator is the authoritative state machine, so the controller now
@@ -660,3 +676,28 @@ reverse.** The camera-dark branch now just RIDES IT OUT: steering 0, accel =
 CRUISE (don't act on garbage detections, never reverse). HUD shows `CAM_DARK->HOLD`.
 `detect_low_brightness` is retained only to drive that hold-straight safety, not
 recovery. Challenge 1 is effectively unaddressable from our inputs.
+
+---
+
+## Phase 15 - Confidence gating + temporal confirmation (next)
+
+The next improvement is Task 1: stop weak or one-frame detections from reaching
+the controller. The current detector already has HSV, road-mask, shape, and
+growth gates, but controller decisions still use "object exists" as truth.
+
+Planned changes are tracked in `task1.md`:
+- Add `confidence` to orb candidates from `_orb_contours_info`.
+- Add `confidence` to `_largest_blob` results for front police and rear chasing
+  car.
+- Apply per-class thresholds for `red`, `green`, `yellow`, `police`, and
+  `other_car`.
+- Add a short N-of-M temporal confirmer.
+- Recompute `front_per['red']`, `front_per['green']`, `front_per['yellow']`,
+  `front_per['orbs']`, and `front_per['nearest']` after gating so the imminence
+  branch cannot steer on a dropped object.
+- Keep Phase 14 camera-dark behaviour unchanged: `CAM_DARK->HOLD`, steering 0,
+  cruise throttle, never reverse.
+
+Definition of done: the `Perception` overlay draws only confirmed detections,
+`processing_task` consumes only gated perception, front police and rear teal
+chasing car still trigger correctly, and camera corruption never sends reverse.

@@ -1,6 +1,6 @@
 # Plan: OpenCV Auto-Detection for SpeedTrials2D (RTSE Competition)
 
-> **Current status: Phase 14 + Task 1 next.** The active controller is a
+> **Current status: Phase 16 implemented + Task 1 next.** The active controller is a
 > pure-perception V2.0 driver. The Unity simulator is the authoritative state
 > machine; our code does not track score, hit cooldowns, yellow-event state,
 > target speed, or police-active state in parallel.
@@ -12,9 +12,10 @@
 >
 > Current behaviour: front camera detects red/green/yellow tokens and the front
 > police car; rear camera detects only the teal chasing car; camera-dark/
-> corruption holds straight at cruise and must not reverse. The next planned
-> improvement is confidence gating plus temporal confirmation so weak/flickering
-> detections do not reach steering.
+> corruption holds straight at cruise and must not reverse. Planned improvements
+> are confidence gating plus temporal confirmation, and a separate main-window
+> sampler for Challenge 1's `#020202` dim because the TCP camera feed cannot see
+> that effect.
 
 > **⚠ Status (Phase 3, current):** the shadow-state event engine described in Phases 1–2
 > below has been **removed**. The official rules poster (`game rule/RTSE_Poster_game.pdf`)
@@ -701,3 +702,91 @@ Planned changes are tracked in `task1.md`:
 Definition of done: the `Perception` overlay draws only confirmed detections,
 `processing_task` consumes only gated perception, front police and rear teal
 chasing car still trigger correctly, and camera corruption never sends reverse.
+
+---
+
+## Phase 16 - Challenge 1 main-window dim detection (implemented)
+
+New observation: the Challenge 1 dim colour is `#020202`, but the dim is applied
+to the game's **main viewport**, not the TCP camera feed. That explains why the
+car cannot detect the event from `front_frame`: the camera stays bright while the
+player view is dark. Camera-only detection is therefore the wrong sensor for this
+challenge.
+
+### Preferred solution - sample the SpeedTrials2D window
+
+Implemented in `sample_drive.py` as a lightweight main-window brightness sampler:
+
+1. Locate the `SpeedTrials2D` window using Win32 APIs (`ctypes`) or a small screen
+   capture dependency if permitted.
+2. Capture a small central ROI from the game window at 5-10 Hz. Do not capture
+   the whole desktop at 30 Hz; this is a low-rate event detector.
+3. Detect the dim event by looking for near-black coverage:
+   - exact target: RGB close to `#020202`
+   - practical threshold: median/percentile RGB below about `20`
+   - require the dark condition for 2-3 consecutive samples to avoid menu/loading
+     false positives
+   - delay arming for the first `2.0s` after the first valid camera frame
+   - require the main window to be seen bright/clear before accepting a dim event,
+     so a previous run ending on a dim screen cannot consume the one allowed
+     recovery
+4. When confirmed, set `shared_data['main_view_dim'] = True`.
+5. In `processing_task`, let this flag override steering/throttle:
+   - `steering = 0.0`
+   - `accel = -1.0`
+   - hold until the sampled main-window ROI is bright again, or until a short
+     max recovery timeout expires
+6. Keep the existing camera-dark branch separate:
+   - camera corruption/dark patches still mean `CAM_DARK->HOLD`
+   - only main-window `#020202` dim may trigger reverse recovery
+
+This restores Challenge 1 handling without confusing it with yellow-hit camera
+corruption.
+
+### RT integration
+
+Implemented as a low-rate helper called from `processing_task`:
+
+| Task | Suggested period | Priority | Role |
+| --- | --- | --- | --- |
+| `_detect_main_view_dim` helper | 0.100 s internal gate | Processing task | Sample SpeedTrials2D main viewport for `#020202` dim |
+
+Shared state:
+- `shared_data['main_view_dim'] = False`
+- `shared_data['main_view_dim_level'] = 255.0`
+- written under `state_lock`
+
+The helper delays arming at startup, waits until it has seen a clear main window,
+and then stops sampling after the first confirmed dim event clears, because the
+event happens once early in the run.
+
+### Fallback if screen capture is not allowed
+
+If we are limited strictly to camera + control sockets, Challenge 1 is not
+observable. The only possible fallback is an open-loop recovery pulse during the
+first 10 seconds, because the rules say the event happens once in that window.
+This is risky because sending `accel=-1.0` when no dim is active costs speed.
+
+Risk-controlled fallback:
+- Start a run timer when the first valid front frame arrives.
+- Between `t=1s` and `t=10s`, send very short recovery probes such as
+  `accel=-1.0` for `0.10-0.20s`, then resume cruise.
+- A/B test several schedules:
+  - one pulse at `t=5s`
+  - pulses at `t=3s`, `t=6s`, `t=9s`
+  - low-duty-cycle pulse every `1s`
+- Keep only if the average distance improves over at least 3 runs.
+
+Do not implement the open-loop pulse unless the main-window sampler is disallowed
+or unreliable.
+
+### Validation
+
+1. During a real Challenge 1 dim, sampled main-window pixels should show dominant
+   RGB near `#020202` while `front_frame` brightness remains high.
+2. HUD should distinguish the two cases:
+   - `MAIN_DIM->RECOVER` for Challenge 1, sends `accel=-1.0`
+   - `CAM_DARK->HOLD` for camera corruption, sends cruise
+3. Normal driving and yellow camera-corruption events must not trigger reverse.
+4. Confirm over at least 3 runs that Challenge 1 no longer causes the -10% speed
+   penalty window to persist.

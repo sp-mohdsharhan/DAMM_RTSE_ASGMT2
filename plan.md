@@ -1,5 +1,22 @@
 # Plan: OpenCV Auto-Detection for SpeedTrials2D (RTSE Competition)
 
+> **Current status: Phase 16 implemented + Task 1 next.** The active controller is a
+> pure-perception V2.0 driver. The Unity simulator is the authoritative state
+> machine; our code does not track score, hit cooldowns, yellow-event state,
+> target speed, or police-active state in parallel.
+>
+> **Important:** Phases 1-13 are retained as design history. Some older sections
+> still say "current" because they were current at the time they were written.
+> For implementation decisions, use the newest phase at the bottom of this file,
+> `task1.md`, `sample_drive.py`, and `image_detection.py`.
+>
+> Current behaviour: front camera detects red/green/yellow tokens and the front
+> police car; rear camera detects only the teal chasing car; camera-dark/
+> corruption holds straight at cruise and must not reverse. Planned improvements
+> are confidence gating plus temporal confirmation, and a separate main-window
+> sampler for Challenge 1's `#020202` dim because the TCP camera feed cannot see
+> that effect.
+
 > **⚠ Status (Phase 3, current):** the shadow-state event engine described in Phases 1–2
 > below has been **removed**. The official rules poster (`game rule/RTSE_Poster_game.pdf`)
 > confirms the Unity simulator is the authoritative state machine, so the controller now
@@ -350,3 +367,426 @@ This was incorrect on three counts:
 6. Police visible in rear → `events=[POLICE]`; if a red is in front, `str` flips to steer **toward** the red.
 7. Scene dims → `events=[LOW_LIGHT]`, `acc` drops to `0.40`.
 8. Ctrl+C → "System terminated cleanly." within ~1 s.
+
+---
+
+## Phase 4 — Green-first priority + curve/hill awareness (current)
+
+### Why we changed
+This game build ships **no police vehicle and no trailing/overtaking car**, so
+the two rear-threat reactions that previously outranked the colour stack were
+dead weight. The objective is now plainly green-token collection (green count is
+the score driver), so green is promoted to the top of the steering stack.
+
+### Removed (documented for future reference)
+| Removed | Notes |
+| --- | --- |
+| **POLICE-SEEK MODE** | rear-cam blue + front red → steer *toward* the red. Code preserved in the `REMOVED` comment block above `_compute_steering` in `sample_drive.py`. |
+| **TRAILING-CAR FORCED SWERVE** | growing rear contour → fixed ±`LANE_CHANGE_STEER` swerve, alternating. `_lane_change_until` / `_lane_change_dir` timer deleted; constants `LANE_CHANGE_DURATION_S`, `LANE_CHANGE_STEER` kept in `image_detection.py`. |
+
+**`detect_rear()` has now been removed entirely** (function, police HSV +
+calibration bucket, other-car contour-growth tracking) along with the REAR
+overlay panel — the overlay is front-only. `ReadBackCamera` still runs at
+50 ms / LOW purely to **drain the back socket** so the game's sender can't block;
+nothing consumes its frames. To restore police/trailing behaviour: re-add
+`detect_rear()`, the `_lane_change_*` timer, the REAR panel, and re-insert both
+steering branches at the **top** of `_compute_steering` (they are safety/penalty
+overrides and must outrank colours).
+
+### New steering priority (current)
+1. **GREEN seek** — *literal override*: green wins whenever visible. **Committed
+   pursuit**, not a gentle pull: if the green sits off-centre
+   (`|cx| > GREEN_LANE_CHANGE_BAND = 0.12`, i.e. in another lane) we steer at
+   full `GREEN_SEEK_GAIN = 0.9` toward it and hold for `GREEN_SEEK_HOLD_S = 0.5 s`
+   so a green that flickers / leaves the ROI mid-crossing still completes the
+   lane change; once it lines up ahead we ease to a `GREEN_ATTRACT_GAIN * cx`
+   fine-track. (The original `0.6 * cx` P-term could never cross a lane: far
+   greens have a tiny centroid offset, so the car only turned when the green was
+   already dead-ahead — too late. Side ROI also narrowed `0.15 → 0.10` so
+   outer-lane greens stay in view.)
+2. **RED evade** — committed lane change away from red, with the 1.6 s latch +
+   0.35 s settle counter-steer.
+3. **YELLOW evade** — swerve away when centred & close.
+4. **Lane follow** — `LANE_GAIN * lane_offset + LANE_CURVE_GAIN * curve_bias`
+   (falls back to curve bias alone when no Hough lane lines are found).
+5. Default `0.0`.
+
+### Lane-curve awareness
+`detect_lane_curve()` now also returns `curve_bias ∈ [-1,+1]` (positive = bends
+right) and `lane_center_norm`. It fits `x = f(y)` over the warped sliding-window
+pixels and measures lane-centre drift from near→far. Blended into green-seek and
+lane-follow via `LANE_CURVE_GAIN = 0.4` so the car steers into bends early.
+
+### Hill awareness (`detect_slope`)
+New heuristic: walk up the centre-column asphalt band to find the road's top
+edge, track an EMA of the flat-road baseline, flag `is_hill` when the horizon
+deviates by `SLOPE_HILL_DEV`. On a hill:
+- **Prepare for lane change** — red/yellow trigger areas scaled by
+  `HILL_AREA_SCALE = 0.5`, so evasion fires on smaller/closer orbs that crest
+  with little reaction distance.
+> Single-frame heuristic; `SLOPE_*`, `ASPHALT_*`, `ROAD_ROW_THRESH` are
+> first-pass and should be tuned against live runs.
+
+### Verification (Phase 4)
+1. `python sample_drive.py` → 4 "Started" lines, "Perception" + "Lane Curve" windows.
+2. GREEN visible (even with a RED nearby) → `str` biases toward green (literal override).
+3. RED in lane, no green → 1.6 s swerve + 0.35 s settle.
+4. YELLOW centred, no green/red → brief swerve away.
+5. Curved track → `str` anticipates the bend before the near lane offset moves.
+6. Crest → `events=[HILL]`, `acc` unchanged (no slow-down), evasion triggers on more distant orbs.
+7. Scene dims (flat) → `events=[LOW_LIGHT]`, `acc` `0.40`.
+8. Ctrl+C → "System terminated cleanly." within ~1 s.
+
+---
+
+## Phase 5 — Keep-LEFT home-lane strategy (current)
+
+### Why we changed
+Green-first (Phase 4) chased greens across every lane and weaved. We switched to
+a **stable keep-left policy**: the far-left lane is "home"; the car rides it and
+only makes small left/right moves around it. (Mirror of the earlier keep-right
+trial — flip every sign / side to switch home edges.)
+
+### Strategy (supersedes the Phase 4 priority stack)
+Priority in `_compute_steering` (highest wins):
+1. **RED dodge-RIGHT** — red ahead *in our path* (`-RED_AVOID_BAND_FRAC < cx < EVADE_RIGHT_IGNORE`)
+   → commit a full right swerve (`+RED_AVOID_GAIN`) for `RED_LANE_CHANGE_DURATION_S`,
+   then a settle phase that hands back to the home-left steer. We always dodge
+   **right** — riding the left edge leaves no room to the left. Reds clearly in a
+   **right** lane (`cx ≥ EVADE_RIGHT_IGNORE`) are ignored (not our path).
+2. **GREEN seek** — only if **reachable from the left** (`cx < GREEN_REACH_RIGHT`);
+   greens further right are ignored (won't cross right for them). Reachable green one
+   lane over → commit toward it, then home pulls back left.
+3. **YELLOW dodge-RIGHT** — same gating as red, fixed `+YELLOW_AVOID_GAIN`.
+4. **HOME (keep-left)** — `LEFT_LANE_BIAS + LANE_GAIN*lane_offset + LANE_CURVE_GAIN*curve_bias`.
+   The lane-follow term is feedback: the car settles left-of-centre and the bias
+   sets how far left.
+
+### New constants (`image_detection.py`)
+- `LEFT_LANE_BIAS = -0.35` — constant leftward steer (the keep-left knob; negative = left).
+- `GREEN_REACH_RIGHT = 0.35` — how far right we'll reach for a green (~one lane).
+- `EVADE_RIGHT_IGNORE = 0.25` — reds/yellows further right than this are off-path, ignored.
+
+> **Tuning caveat:** a *constant* bias hugs the left side of the **current** lane
+> via lane-follow equilibrium. To migrate fully to the far-left lane the bias must
+> be strong enough to cross lanes until the left road-edge line holds it. If it
+> won't reach the edge, make `LEFT_LANE_BIAS` more negative or switch to explicit
+> left-edge detection (deferred). Needs live tuning, like the rest of Phase 4/5.
+
+### Verification (Phase 5)
+1. Empty road → `str` ≈ `LEFT_LANE_BIAS` (negative), car drifts to and holds the far-left lane.
+2. RED ahead in our lane → hard **right** swerve, then drifts back left.
+3. RED in a right lane → ignored, car stays left.
+4. GREEN one lane to the right → brief right reach onto it, then back left.
+5. GREEN far right → ignored, car stays left.
+6. YELLOW ahead → brief right dodge, then back left.
+
+---
+
+## Phase 6 — Drop the home-lane hug (current)
+
+After a recorded run the keep-left hug pinned the car to the left curb
+(`str≈-0.90` sustained). Removed the home-lane bias entirely: the car now
+**centres in its lane** and reacts to orbs symmetrically.
+
+- Removed constants `LEFT_LANE_BIAS`, `GREEN_REACH_RIGHT`, `EVADE_RIGHT_IGNORE`
+  (and their imports). To restore a hug, re-add per Phase 5.
+- `_compute_steering` priority (unchanged order, bias removed):
+  1. **RED evade** — committed lane change *away* from red (latch + direction-flip + settle).
+  2. **GREEN seek** — committed lane change toward green (both directions), then fine-track.
+  3. **YELLOW evade** — swerve away when centred & close.
+  4. **HOME** — `LANE_GAIN*lane_offset + LANE_CURVE_GAIN*curve_bias` (centres in lane).
+
+---
+
+## Phase 7 — On-road, oval-tolerant orb detection (current)
+
+A recorded run showed big **close** orbs were missed: `ORB_MAX_AREA_FRAC = 0.07`
+discarded any orb that filled >7% of the ROI (i.e. the close orbs about to be
+hit), and the strict circularity/fill gate dropped perspective-squashed ovals.
+That cap existed to stop green **grass** shoulders being read as giant green
+orbs. Fix: gate detection to the **asphalt region** so grass is excluded by
+*location*, which lets the shape gate relax.
+
+- `_road_region_mask(hsv)` — largest low-saturation (asphalt) blob → convex-hull
+  fill → modest dilation. Orbs are kept only if their centroid lies on this mask.
+- Relaxed ON-ROAD thresholds (`ORB_ROAD_*`): area cap `0.45`, circularity `0.45`,
+  fill `0.55`, aspect `0.45–2.10` → big, close, **oval** orbs now pass.
+- `_largest_contour_info` parameterised (thresholds + `road_mask`); falls back to
+  the strict grass-safe defaults when no road is found that frame.
+- **Decision:** off-road orbs (e.g. greens on the grass shoulder) are *ignored*
+  by design — the car stays on track. Only on-road orbs are chased/avoided.
+
+### Grass-as-green fix (data-backed, from recording 095741)
+A second recording still showed grass detected as green. Sampling the frame:
+grass green is **H~60, S~120, V~65** — squarely inside the old green range
+(`V>60`), while real orbs are **V>180**. Green-hued pixels are cleanly bimodal
+(grass V<90, orbs V>180, the 90–150 band empty). Root cause: auto-calibration's
+sampling gate (`S>80 & V>60`) ingested dark grass as a "green" colour and learned
+a contaminated range. Fixes:
+- `HSV_GREEN` value floor `60 → 110`.
+- `calibrate_step` sampling gate value floor `60 → 110` (don't learn dark
+  grass/trees as a colour).
+Result: grass green pixels on the test frame dropped 2316 → 59; bright on-road
+orbs still detected.
+
+> Validation note: offline tests on recorded frames use *default* HSV (the live
+> pipeline auto-calibrates), so colour matches aren't representative — the
+> road-gating geometry is. Needs a live run to confirm + tune `ROAD_*` / `ORB_ROAD_*`.
+>
+> Gray-orb (yellow-hit "corrupted camera" debuff) detection — when orbs desaturate
+> and colour is unreadable — is a deferred follow-up: a colour-agnostic blob-on-road
+> detector could still localise them (but couldn't tell red from green).
+
+---
+
+## Phase 8 — Green-first, no lane centering (current)
+
+- **Priority reordered** to **GREEN seek > RED evade > YELLOW evade** (green is
+  literal override again — wins whenever a green is in view, even over a red).
+- **Lane centering removed.** The HOME stage (`LANE_GAIN*lane_offset + curve`) is
+  gone; when no orb is in view the controller returns **0.0 (go straight)**.
+  `lane_offset` is still computed for the overlay's lane line, not for steering.
+- Verified: empty view → 0.0; green+red → green wins; red+yellow → red wins.
+
+> Trade-off: with no centering the car only steers for orbs, so on a sharp bend
+> with no orbs it will run straight. Re-add the HOME stage (Phase 6) if it drifts
+> off-road on empty curves.
+
+---
+
+## Phase 9 — Pinned sprite colours + calibration off (current)
+
+All three orb colours measured from the sprites and **pinned** (auto-calibration
+fully disabled — `_calib_state['done']=True`, `_HUE_BUCKETS=[]`, calibrate_step
+never runs). More robust than calibration, which kept getting grass-contaminated.
+
+| Colour | OpenCV HSV range (lo → hi) | Source shades |
+|---|---|---|
+| GREEN  | (48,30,130) → (66,255,255) | #BDF3B5 #87E27E #5AB853 (H~57, V>180) |
+| RED    | (0,60,120)→(8,…) + (168,60,120)→(179,…) | #F9ACB9 #E66179 #C12742 (H~175) |
+| YELLOW | (16,100,120) → (32,255,255) | #FEEA75 #DFA214 #9D700C (H~21-26) |
+
+Detection is gated to the **asphalt** (`_road_region_mask`): measured asphalt is
+low-sat grey (S~0-75, V~60-100) → `ROAD_SAT_MAX` raised 70→85. Orbs (V>185) and
+grass (S~120) stay excluded; convex-hull fill bridges the holes orbs punch in the
+road so an orb's centroid still reads as on-road. ~65% ROI coverage on a test frame.
+
+---
+
+## Phase 11 — RTSE_Phase_1_V2.0 challenges (branch: feature/gameplay-v2-challenges)
+
+The new release adds three challenges; rear detection (removed in Phase 6) is
+restored for two of them.
+
+### Challenge 1 — Low Light
+Brightness drops + all tokens become unknown. `detect_low_brightness` already
+finds it; the controller now sends **`accel = -1.0`** (steering 0) to recover the
+light and holds it until brightness returns, ignoring the corrupted tokens.
+(Replaces the old "ease throttle to 0.4" behaviour.)
+
+### Challenge 2 — Chasing car (rear)
+`detect_rear` (restored) flags a growing non-police vehicle behind. Arms a
+forced lane change (`LANE_CHANGE_STEER` for `LANE_CHANGE_DURATION_S`, alternating
+direction) to avoid the rear-end (-50% speed). 1st appearance 10 s / 2nd 3 s are
+game-enforced; we just react to the growing car.
+
+### Challenge 3 — Police car (rear)
+`detect_rear` flags the police car (HSV_POLICE — **PLACEHOLDER blue, needs a
+V2.0 screenshot to tune**). While present, steer the FRONT toward a **red token**
+to escape (or lane-change to dodge if no red is visible). Collision = game over,
+so police is the top steering priority.
+
+### Steering priority (V2.0, _compute_steering)
+0a POLICE→grab red · 0b CHASING car→swerve · 1 imminence nearest-orb ·
+2 colour priority GREEN>RED>YELLOW · straight. Low-light recovery overrides
+everything in processing_task (accel = -1.0).
+
+### Restored / changed
+- `detect_rear`, `_largest_blob` (no orb-shape filter — cars aren't round),
+  `HSV_POLICE`, rear panel in `draw_overlay`, `perception_back`, the
+  `_lane_change_*` latch, and rear consumption in `processing_task`.
+
+> **Needs a live run + V2.0 screenshot:** police colour (HSV_POLICE), and confirm
+> the chasing car reads as a saturated rear blob. Detection logic verified on
+> synthetic input; colours/thresholds are first-pass.
+
+---
+
+## Phase 12 — V2.0 fixes from gameplay analysis (recording 120026)
+
+A recorded V2.0 run showed all three challenges failing. Root causes found and
+fixed from measured frames:
+
+### Challenge 2 — chasing car was a constant false positive
+The rear "any saturated blob" detector fired every frame on blue sky/buildings
+and rear-floating orbs → nonstop phantom swerve (`str=±0.80`) that wrecked the run.
+**Fix:** the chasing car is the **TEAL car** (measured H~86, S~190). Pinned
+`HSV_CHASING = (78,120,40)-(98,255,255)`. Teal is distinct from sky (H~120),
+police blue (H 112-135) and every orb, so `detect_rear` now only fires on the real
+car. Verified: teal car detected, sky-only → None.
+
+### Challenge 3 — police is in the FRONT, not the rear
+My first cut detected police in the rear (never fired). Police is the **blue+red
+car ahead**. **Fix:** detect the blue half in `detect_front_objects` (`'police'`).
+Controller: if it's close & centred → **dodge** (collision = game over); else
+**seek a bright red token** to escape. The car's dark-red half (V~108) is below the
+red-token V floor (120), so it's not mistaken for a grabbable token. Removed police
+from `detect_rear`. Measured: police blue H125 S247; red half V108; red token V238.
+
+### Challenge 1 — low-light never triggered
+Measured: normal centre-crop mean V ~105-138, darkness event ~46-70. Old threshold
+50 sat inside the dark band (fired only intermittently). **Fix:**
+`LOW_BRIGHTNESS_THRESHOLD 50 -> 85` (clean gap). Already sends `accel=-1.0` to recover.
+
+### Steering priority (V2.0 final)
+0a POLICE ahead (dodge if centred-close, else grab red) · 0b CHASING car (teal,
+rear) → lane change · 1 imminence nearest-orb · 2 colour GREEN>RED>YELLOW · straight.
+Low-light recovery (accel=-1.0) overrides all in processing_task.
+
+> Still first-pass on a live run: POLICE_DODGE_AREA/BAND, chasing-car growth
+> threshold, and LOW_BRIGHTNESS_THRESHOLD=85 (screenshot-measured; confirm on the
+> real socket feed).
+
+---
+
+## Phase 13 — Low-light vs camera-malfunction discriminator
+
+The reverse-recovery (accel=-1.0) was at risk of false-firing on the yellow-hit
+**camera malfunction** (black patches), not just the genuine **low-light** event.
+Measured (centre crop): true darkness p90 V ~49 (whole scene uniformly dim);
+malfunction p90 V ~187 (black rectangles, but visible parts bright). Mean V lowers
+for both → unreliable. **Fix:** `detect_low_brightness` now thresholds the
+**90th-percentile V** (`< 90`), not the mean — fires only on uniform darkness.
+Verified: low-bright→True, malfunction→False, normal driving (p90 190-214)→False.
+So the car only reverses for the real Challenge 1 event.
+
+---
+
+## Phase 14 — Low-light NOT in camera feed; stop the false reverse
+
+User confirmed (and the data agrees): the **Challenge 1 dim is applied to the
+game's MAIN view only, NOT the camera feed** — during the real first-10s dim
+window the camera BRI stayed ~242. So the dim is **undetectable from camera input**
+and the `accel=-1.0` recovery can't be triggered legitimately. What our detector
+was actually catching (BRI ~192) is the **yellow-hit camera CORRUPTION** (black
+patches), for which there is no recovery.
+
+So the reverse only ever fired on the corruption — pure harm. **Removed the
+reverse.** The camera-dark branch now just RIDES IT OUT: steering 0, accel =
+CRUISE (don't act on garbage detections, never reverse). HUD shows `CAM_DARK->HOLD`.
+`detect_low_brightness` is retained only to drive that hold-straight safety, not
+recovery. Challenge 1 is effectively unaddressable from our inputs.
+
+---
+
+## Phase 15 - Confidence gating + temporal confirmation (next)
+
+The next improvement is Task 1: stop weak or one-frame detections from reaching
+the controller. The current detector already has HSV, road-mask, shape, and
+growth gates, but controller decisions still use "object exists" as truth.
+
+Planned changes are tracked in `task1.md`:
+- Add `confidence` to orb candidates from `_orb_contours_info`.
+- Add `confidence` to `_largest_blob` results for front police and rear chasing
+  car.
+- Apply per-class thresholds for `red`, `green`, `yellow`, `police`, and
+  `other_car`.
+- Add a short N-of-M temporal confirmer.
+- Recompute `front_per['red']`, `front_per['green']`, `front_per['yellow']`,
+  `front_per['orbs']`, and `front_per['nearest']` after gating so the imminence
+  branch cannot steer on a dropped object.
+- Keep Phase 14 camera-dark behaviour unchanged: `CAM_DARK->HOLD`, steering 0,
+  cruise throttle, never reverse.
+
+Definition of done: the `Perception` overlay draws only confirmed detections,
+`processing_task` consumes only gated perception, front police and rear teal
+chasing car still trigger correctly, and camera corruption never sends reverse.
+
+---
+
+## Phase 16 - Challenge 1 main-window dim detection (implemented)
+
+New observation: the Challenge 1 dim colour is `#020202`, but the dim is applied
+to the game's **main viewport**, not the TCP camera feed. That explains why the
+car cannot detect the event from `front_frame`: the camera stays bright while the
+player view is dark. Camera-only detection is therefore the wrong sensor for this
+challenge.
+
+### Preferred solution - sample the SpeedTrials2D window
+
+Implemented in `sample_drive.py` as a lightweight main-window brightness sampler:
+
+1. Locate the `SpeedTrials2D` window using Win32 APIs (`ctypes`) or a small screen
+   capture dependency if permitted.
+2. Capture a small central ROI from the game window at 5-10 Hz. Do not capture
+   the whole desktop at 30 Hz; this is a low-rate event detector.
+3. Detect the dim event by looking for near-black coverage:
+   - exact target: RGB close to `#020202`
+   - practical threshold: median/percentile RGB below about `20`
+   - require the dark condition for 2-3 consecutive samples to avoid menu/loading
+     false positives
+   - delay arming for the first `2.0s` after the first valid camera frame
+   - require the main window to be seen bright/clear before accepting a dim event,
+     so a previous run ending on a dim screen cannot consume the one allowed
+     recovery
+4. When confirmed, set `shared_data['main_view_dim'] = True`.
+5. In `processing_task`, let this flag override steering/throttle:
+   - `steering = 0.0`
+   - `accel = -1.0`
+   - hold until the sampled main-window ROI is bright again, or until a short
+     max recovery timeout expires
+6. Keep the existing camera-dark branch separate:
+   - camera corruption/dark patches still mean `CAM_DARK->HOLD`
+   - only main-window `#020202` dim may trigger reverse recovery
+
+This restores Challenge 1 handling without confusing it with yellow-hit camera
+corruption.
+
+### RT integration
+
+Implemented as a low-rate helper called from `processing_task`:
+
+| Task | Suggested period | Priority | Role |
+| --- | --- | --- | --- |
+| `_detect_main_view_dim` helper | 0.100 s internal gate | Processing task | Sample SpeedTrials2D main viewport for `#020202` dim |
+
+Shared state:
+- `shared_data['main_view_dim'] = False`
+- `shared_data['main_view_dim_level'] = 255.0`
+- written under `state_lock`
+
+The helper delays arming at startup, waits until it has seen a clear main window,
+and then stops sampling after the first confirmed dim event clears, because the
+event happens once early in the run.
+
+### Fallback if screen capture is not allowed
+
+If we are limited strictly to camera + control sockets, Challenge 1 is not
+observable. The only possible fallback is an open-loop recovery pulse during the
+first 10 seconds, because the rules say the event happens once in that window.
+This is risky because sending `accel=-1.0` when no dim is active costs speed.
+
+Risk-controlled fallback:
+- Start a run timer when the first valid front frame arrives.
+- Between `t=1s` and `t=10s`, send very short recovery probes such as
+  `accel=-1.0` for `0.10-0.20s`, then resume cruise.
+- A/B test several schedules:
+  - one pulse at `t=5s`
+  - pulses at `t=3s`, `t=6s`, `t=9s`
+  - low-duty-cycle pulse every `1s`
+- Keep only if the average distance improves over at least 3 runs.
+
+Do not implement the open-loop pulse unless the main-window sampler is disallowed
+or unreliable.
+
+### Validation
+
+1. During a real Challenge 1 dim, sampled main-window pixels should show dominant
+   RGB near `#020202` while `front_frame` brightness remains high.
+2. HUD should distinguish the two cases:
+   - `MAIN_DIM->RECOVER` for Challenge 1, sends `accel=-1.0`
+   - `CAM_DARK->HOLD` for camera corruption, sends cruise
+3. Normal driving and yellow camera-corruption events must not trigger reverse.
+4. Confirm over at least 3 runs that Challenge 1 no longer causes the -10% speed
+   penalty window to persist.

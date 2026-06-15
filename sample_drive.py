@@ -7,7 +7,6 @@ import time
 #import keyboard
 import select
 import ctypes
-from ctypes import wintypes
 #  sharhan edit
 # Perception layer (HSV calibration, contour shape filters, lane offset,
 # brightness, overlay rendering) lives in image_detection.py. This module
@@ -38,23 +37,6 @@ from image_detection import (
 CRUISE_THROTTLE = 0.8                    # normal forward cruise
 LOW_BRIGHTNESS_THROTTLE = -1.0           # recover lighting when tokens become invisible in low-light conditions
 
-# Challenge 1 main-view dim detection. The dim colour (#020202) is applied to
-# the game window, not to the TCP camera feed, so this samples the SpeedTrials2D
-# client area directly at low rate. Camera-dark/corruption remains a separate
-# hold-straight path.
-MAIN_DIM_SAMPLE_PERIOD_S = 0.10
-MAIN_DIM_DARK_RGB_MAX = 20
-MAIN_DIM_MIN_DARK_FRAC = 0.50
-MAIN_DIM_CONFIRM_SAMPLES = 2
-MAIN_DIM_CLEAR_SAMPLES = 2
-MAIN_DIM_ARM_DELAY_S = 2.0
-MAIN_DIM_CLEAR_RGB_MIN = 40
-MAIN_DIM_MAX_CLEAR_DARK_FRAC = 0.25
-MAIN_DIM_GRID_COLS = 9
-MAIN_DIM_GRID_ROWS = 7
-MAIN_DIM_WINDOW_TITLE = "SpeedTrials2D"
-
-
 # ---------------------------------------------------------
 # Configuration
 # ---------------------------------------------------------
@@ -77,8 +59,6 @@ shared_data = {
     'accel_cmd': 0.0,
     'perception_front': {},
     'perception_back': {},   # V2.0: rear police (Ch.3) + chasing car (Ch.2)
-    'main_view_dim': False,
-    'main_view_dim_level': 255.0,
 }
 data_lock = threading.Lock()
 state_lock = threading.Lock()
@@ -275,196 +255,6 @@ _green_seek = {'until': 0.0, 'dir': 0}
 _lane_change_until = 0.0
 _lane_change_dir = 1
 
-_main_dim_state = {
-    'hwnd': None,
-    'last_sample_ts': 0.0,
-    'dark_hits': 0,
-    'clear_hits': 0,
-    'run_start_ts': None,
-    'armed': False,
-    'seen_clear': False,
-    'active': False,
-    'completed': False,
-    'level': 255.0,
-    'dark_frac': 0.0,
-    'window_found': False,
-}
-
-
-def _find_speedtrials_window():
-    """Return the HWND for the SpeedTrials2D game window, or None."""
-    try:
-        user32 = ctypes.windll.user32
-        user32.IsWindowVisible.argtypes = [wintypes.HWND]
-        user32.IsWindowVisible.restype = wintypes.BOOL
-        user32.GetWindowTextW.argtypes = [wintypes.HWND, wintypes.LPWSTR, ctypes.c_int]
-        user32.GetWindowTextW.restype = ctypes.c_int
-    except Exception:
-        return None
-
-    matches = []
-    enum_proc_type = ctypes.WINFUNCTYPE(wintypes.BOOL, wintypes.HWND, wintypes.LPARAM)
-
-    def _enum_proc(hwnd, _lparam):
-        if not user32.IsWindowVisible(hwnd):
-            return True
-        title = ctypes.create_unicode_buffer(256)
-        user32.GetWindowTextW(hwnd, title, len(title))
-        if MAIN_DIM_WINDOW_TITLE.lower() in title.value.lower():
-            matches.append(hwnd)
-            return False
-        return True
-
-    try:
-        callback = enum_proc_type(_enum_proc)
-        user32.EnumWindows(callback, 0)
-    except Exception:
-        return None
-    return matches[0] if matches else None
-
-
-def _sample_main_window_light(hwnd):
-    """Sparse-sample the game client area. Returns (is_dim, level, dark_frac) or None."""
-    try:
-        user32 = ctypes.windll.user32
-        gdi32 = ctypes.windll.gdi32
-        user32.IsWindow.argtypes = [wintypes.HWND]
-        user32.IsWindow.restype = wintypes.BOOL
-        user32.GetClientRect.argtypes = [wintypes.HWND, ctypes.POINTER(wintypes.RECT)]
-        user32.GetClientRect.restype = wintypes.BOOL
-        user32.ClientToScreen.argtypes = [wintypes.HWND, ctypes.POINTER(wintypes.POINT)]
-        user32.ClientToScreen.restype = wintypes.BOOL
-        user32.GetDC.argtypes = [wintypes.HWND]
-        user32.GetDC.restype = wintypes.HDC
-        user32.ReleaseDC.argtypes = [wintypes.HWND, wintypes.HDC]
-        user32.ReleaseDC.restype = ctypes.c_int
-        gdi32.GetPixel.argtypes = [wintypes.HDC, ctypes.c_int, ctypes.c_int]
-        gdi32.GetPixel.restype = wintypes.COLORREF
-    except Exception:
-        return None
-
-    if not hwnd or not user32.IsWindow(hwnd):
-        return None
-
-    rect = wintypes.RECT()
-    if not user32.GetClientRect(hwnd, ctypes.byref(rect)):
-        return None
-    width = int(rect.right - rect.left)
-    height = int(rect.bottom - rect.top)
-    if width <= 20 or height <= 20:
-        return None
-
-    origin = wintypes.POINT(0, 0)
-    if not user32.ClientToScreen(hwnd, ctypes.byref(origin)):
-        return None
-
-    desktop_dc = user32.GetDC(0)
-    if not desktop_dc:
-        return None
-
-    max_channels = []
-    dark_count = 0
-    total = 0
-    try:
-        for row in range(MAIN_DIM_GRID_ROWS):
-            yf = 0.25 + 0.50 * (row / max(1, MAIN_DIM_GRID_ROWS - 1))
-            y = int(origin.y + height * yf)
-            for col in range(MAIN_DIM_GRID_COLS):
-                xf = 0.25 + 0.50 * (col / max(1, MAIN_DIM_GRID_COLS - 1))
-                x = int(origin.x + width * xf)
-                color = gdi32.GetPixel(desktop_dc, x, y)
-                if color == -1 or color == 0xFFFFFFFF:
-                    continue
-                r = color & 0xFF
-                g = (color >> 8) & 0xFF
-                b = (color >> 16) & 0xFF
-                level = max(r, g, b)
-                max_channels.append(level)
-                if level <= MAIN_DIM_DARK_RGB_MAX:
-                    dark_count += 1
-                total += 1
-    finally:
-        user32.ReleaseDC(0, desktop_dc)
-
-    if total == 0:
-        return None
-
-    max_channels.sort()
-    median_level = float(max_channels[len(max_channels) // 2])
-    dark_frac = dark_count / float(total)
-    is_dim = dark_frac >= MAIN_DIM_MIN_DARK_FRAC and median_level <= MAIN_DIM_DARK_RGB_MAX
-    return is_dim, median_level, dark_frac
-
-
-def _detect_main_view_dim(now):
-    """Low-rate Challenge 1 detector for the main game window (#020202 dim)."""
-    if _main_dim_state['run_start_ts'] is None:
-        _main_dim_state['run_start_ts'] = now
-    if _main_dim_state['completed']:
-        return False
-    if now - _main_dim_state['last_sample_ts'] < MAIN_DIM_SAMPLE_PERIOD_S:
-        return _main_dim_state['active']
-    _main_dim_state['last_sample_ts'] = now
-
-    hwnd = _main_dim_state['hwnd']
-    try:
-        user32 = ctypes.windll.user32
-        user32.IsWindow.argtypes = [wintypes.HWND]
-        user32.IsWindow.restype = wintypes.BOOL
-        if hwnd is None or not user32.IsWindow(hwnd):
-            hwnd = _find_speedtrials_window()
-            _main_dim_state['hwnd'] = hwnd
-    except Exception:
-        hwnd = None
-        _main_dim_state['hwnd'] = None
-
-    sample = _sample_main_window_light(hwnd)
-    if sample is None:
-        _main_dim_state['window_found'] = False
-        _main_dim_state['level'] = 255.0
-        _main_dim_state['dark_frac'] = 0.0
-        return _main_dim_state['active']
-
-    is_dim, level, dark_frac = sample
-    _main_dim_state['window_found'] = True
-    _main_dim_state['level'] = level
-    _main_dim_state['dark_frac'] = dark_frac
-
-    run_elapsed = now - _main_dim_state['run_start_ts']
-    if run_elapsed < MAIN_DIM_ARM_DELAY_S:
-        _main_dim_state['armed'] = False
-        _main_dim_state['dark_hits'] = 0
-        _main_dim_state['clear_hits'] = 0
-        return False
-
-    _main_dim_state['armed'] = True
-    is_clear = level >= MAIN_DIM_CLEAR_RGB_MIN and dark_frac <= MAIN_DIM_MAX_CLEAR_DARK_FRAC
-    if not _main_dim_state['seen_clear']:
-        if is_clear:
-            _main_dim_state['clear_hits'] += 1
-            if _main_dim_state['clear_hits'] >= MAIN_DIM_CLEAR_SAMPLES:
-                _main_dim_state['seen_clear'] = True
-                _main_dim_state['clear_hits'] = 0
-        else:
-            _main_dim_state['clear_hits'] = 0
-        _main_dim_state['dark_hits'] = 0
-        return False
-
-    if is_dim:
-        _main_dim_state['dark_hits'] += 1
-        _main_dim_state['clear_hits'] = 0
-    else:
-        _main_dim_state['clear_hits'] += 1
-        _main_dim_state['dark_hits'] = 0
-
-    if not _main_dim_state['active'] and _main_dim_state['dark_hits'] >= MAIN_DIM_CONFIRM_SAMPLES:
-        _main_dim_state['active'] = True
-    elif _main_dim_state['active'] and _main_dim_state['clear_hits'] >= MAIN_DIM_CLEAR_SAMPLES:
-        _main_dim_state['active'] = False
-        _main_dim_state['completed'] = True
-
-    return _main_dim_state['active']
-
 # ---------------------------------------------------------------------------
 # V2.0 challenge handling:
 #   * Challenge 1 MAIN DIM (#020202 in the game window): reverse to recover.
@@ -617,7 +407,6 @@ def processing_task():
     hill  = bool(slope and slope['is_hill'])
 
     now = time.monotonic()
-    main_view_dim = _detect_main_view_dim(now)
     # Challenge 2 (V2.0): arm a forced lane change when a rear car is growing
     # (catching up). Arm only when not already swerving so one sustained reading
     # doesn't pin steering; direction alternates each trigger.
@@ -629,14 +418,9 @@ def processing_task():
     # Challenge 3 (V2.0): police car detected in the FRONT camera.
     police_seen = bool(front_per and front_per.get('police'))
 
-    # Main-window dim (#020202) is Challenge 1 and should reverse; camera-dark is
-    # yellow-hit camera corruption and should only hold straight at cruise.
-    if main_view_dim:
+    if low_light:
         steering = 0.0
         accel = LOW_BRIGHTNESS_THROTTLE
-    elif low_light:
-        steering = 0.0
-        accel = CRUISE_THROTTLE
     else:
         # Steering: police(front)/chasing(rear) override -> imminence -> colour priority.
         steering = _compute_steering(front_per, lane_offset, curve_bias, hill,
@@ -648,31 +432,16 @@ def processing_task():
         shared_data['accel_cmd'] = accel
         shared_data['perception_front'] = front_per or {}
         shared_data['perception_back'] = rear_per or {}
-        shared_data['main_view_dim'] = main_view_dim
-        shared_data['main_view_dim_level'] = _main_dim_state['level']
 
     # Overlay (own window; does NOT edit locked read_single_camera).
     try:
         events_visible = []
-        if main_view_dim: events_visible.append('MAIN_DIM->RECOVER')
-        if low_light:    events_visible.append('CAM_DARK->HOLD')  # camera corruption; ride it out (no reverse)
         if police_seen:  events_visible.append('POLICE->GRAB_RED')
         if force_lc:     events_visible.append('CHASING_CAR')
         if hill:         events_visible.append('HILL')
-        if _main_dim_state['run_start_ts'] is not None and not _main_dim_state['completed']:
-            if not _main_dim_state['armed']:
-                events_visible.append('MAIN_DIM_DELAY')
-            elif not _main_dim_state['seen_clear']:
-                events_visible.append('MAIN_WAIT_CLEAR')
-            elif not main_view_dim:
-                events_visible.append('MAIN_ARMED')
         near = front_per.get('nearest') if front_per else None
         if near is not None:
             events_visible.append(f"NEAR:{near['color'][0].upper()} d={near['distance']:.0f}")
-        # Live brightness readouts for tuning main-window dim vs camera corruption.
-        if _main_dim_state['window_found']:
-            events_visible.append(f"MAIN:{_main_dim_state['level']:.0f}/{_main_dim_state['dark_frac']:.2f}")
-        events_visible.append(f"BRI:{scene_brightness_p90(front_frame):.0f}")
         hud = {
             'target': accel * 100.0, 'eff': accel * 100.0,
             'police': police_seen, 'events': events_visible,

@@ -123,21 +123,8 @@ ROAD_ROW_THRESH = 0.20                   # fraction of center-band asphalt for a
 SLOPE_CENTER_BAND = (0.30, 0.70)         # center column fraction used to locate the road horizon
 SLOPE_GAP_TOL = 8                        # rows of non-road (lane dashes) tolerated before the road top
 
-# Low-brightness event detection (V2.0 Challenge 1) — ADAPTIVE. The event is a
-# "brightness decrease", so we detect a relative DROP rather than trusting an
-# absolute value (the live feed's brightness isn't known a-priori). We track a
-# running baseline of the centre-crop 90th-percentile V over bright frames and
-# flag darkness when the current p90 falls below a fraction of it (or below a hard
-# absolute floor). p90 (not mean) keeps the yellow-hit camera MALFUNCTION out: its
-# black patches leave the visible parts bright, so p90 barely drops.
-# Measured on the live feed (HUD BRI): normal p90 ~242, during the dim event ~192
-# (only a ~21% drop — the bright lane markings / sky highlights stay bright, so
-# p90 barely moves). DROP_FRAC 0.85 -> fires below ~206 at a 242 baseline: catches
-# the 192 dim with margin while normal (232-248) stays clear.
-LOW_BRIGHTNESS_DROP_FRAC = 0.85          # p90 < this * running-baseline -> dark
-LOW_BRIGHTNESS_THRESHOLD = 120           # OR absolute p90 below this -> dark (deep darkness backup)
-LOW_BRIGHTNESS_EMA = 0.04                # baseline adaptation rate (bright frames only)
-
+# Low-brightness event detection (poster: "low brightness — turn light on or all tokens yellow")
+LOW_BRIGHTNESS_THRESHOLD = 50            # mean V channel below this -> consider it dim
 
 # ---------------------------------------------------------------------------
 # HSV ranges & auto-calibration state
@@ -756,23 +743,14 @@ def scene_brightness_p90(frame):
 
 
 def detect_low_brightness(frame):
-    """True only for the V2.0 Challenge 1 darkness event (uniform brightness drop).
-
-    Adaptive: fire when the centre-crop p90 V falls below LOW_BRIGHTNESS_DROP_FRAC
-    of a running baseline (or below the absolute floor LOW_BRIGHTNESS_THRESHOLD).
-    Using p90 keeps the yellow-hit camera malfunction out (its visible parts stay
-    bright, so p90 barely drops). The baseline only adapts on non-dark frames."""
+    """True if the scene is dim (poster's 'low brightness' event).
+    Uses mean V on a centre crop so HUD overlays don't bias the result."""
     if frame is None:
         return False
-    p90 = scene_brightness_p90(frame)
-    base = _brightness_baseline['p90']
-    if base is None or base < 1.0:
-        base = max(p90, 1.0)
-    dark = (p90 < base * LOW_BRIGHTNESS_DROP_FRAC) or (p90 < LOW_BRIGHTNESS_THRESHOLD)
-    if not dark:                                       # adapt baseline on bright frames only
-        base = (1.0 - LOW_BRIGHTNESS_EMA) * base + LOW_BRIGHTNESS_EMA * p90
-    _brightness_baseline['p90'] = base
-    return dark
+    h, w = frame.shape[:2]
+    crop = frame[h // 4: h * 3 // 4, w // 4: w * 3 // 4]
+    hsv = cv2.cvtColor(crop, cv2.COLOR_BGR2HSV)
+    return float(hsv[:, :, 2].mean()) < LOW_BRIGHTNESS_THRESHOLD
 
 
 # ---------------------------------------------------------------------------

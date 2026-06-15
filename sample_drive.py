@@ -289,14 +289,22 @@ def _compute_steering(front_per, lane_offset, curve_bias, hill,
         # Close & roughly centred -> dodge the car away from its side.
         if police['area_frac'] > POLICE_DODGE_AREA and abs(pcx) < POLICE_DODGE_BAND:
             return float(RED_AVOID_GAIN * (-1 if pcx >= 0 else 1))
-        # Otherwise grab a RED token to escape (bright red orb; the car's dark-red
-        # half is excluded from 'red' by the V floor, so we won't aim at the car).
-        if red is not None:
-            rcx = red['centroid_x_norm']
+        # Grab a RED orb to escape. Prefer one on the OPPOSITE side of the police
+        # car — steering toward a same-side red would aim us straight into it.
+        reds_in_view = [o for o in orbs if o['color'] == 'red']
+        target_red = None
+        if reds_in_view:
+            police_side = 1 if pcx >= 0 else -1
+            opposite = [o for o in reds_in_view
+                        if (1 if o['centroid_x_norm'] >= 0 else -1) != police_side]
+            target_red = (min(opposite, key=lambda o: o['distance']) if opposite
+                          else min(reds_in_view, key=lambda o: o['distance']))
+        if target_red is not None:
+            rcx = target_red['centroid_x_norm']
             if abs(rcx) > GREEN_LANE_CHANGE_BAND:
                 return float(np.clip(GREEN_SEEK_GAIN * (1 if rcx > 0 else -1), -1.0, 1.0))
             return float(np.clip(GREEN_ATTRACT_GAIN * rcx, -1.0, 1.0))
-        # Police present, not centred, no red in view -> ease away from it.
+        # Police present but no red in view -> ease away from its side.
         return float(0.5 * (-1 if pcx >= 0 else 1))
     # 0b) CHASING CAR behind (Challenge 2): committed lane change away from the rear-end.
     if force_lane_change:

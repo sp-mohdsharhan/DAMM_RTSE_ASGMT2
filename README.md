@@ -1,12 +1,12 @@
-# DAMM_RTSE_ASGMT2 — SpeedTrials2D Autonomous Driver
+# DAMM_RTSE_ASGMT2 - SpeedTrials2D Autonomous Driver
 
-**SECJ 4423 — REAL-TIME SOFTWARE ENGINEERING**
+**SECJ 4423 - REAL-TIME SOFTWARE ENGINEERING**
 
-**Semester II, Academic Session 2025/2026 — Group Assignment 2**
+**Semester II, Academic Session 2025/2026 - Group Assignment 2**
 
-**Lecturer**:  Prof. Ts. Dr. Dayang Norhayati Bte. Abang Jawawi
+**Lecturer**: Prof. Ts. Dr. Dayang Norhayati Bte. Abang Jawawi
 
-**Group**:  DAMM
+**Group**: DAMM
 
 ## Group Members
 
@@ -21,127 +21,168 @@
 
 ## Project Overview
 
-This project implements an **autonomous driving controller** for the **SpeedTrials2D** competition game, built around the four pillars of real-time software engineering:
+This project implements an autonomous driving controller for the SpeedTrials2D competition game. The current implementation is a pure camera-reactive controller: it does not keep a shadow copy of the game's score, speed, cooldowns, or event state. The Unity simulator remains the authoritative state machine, and the Python controller reacts to the current front and rear camera frames.
 
-1. **Concurrency** — multiple cooperating threads (camera readers, perception, control sender)
-2. **Task Periods** — deterministic execution rates per task (each period set to its deadline)
-3. **Task Priorities** — Windows thread priorities tuned to deadline criticality (Deadline-Monotonic)
-4. **Shared-Resource Synchronisation** — split locks (`data_lock` for frames, `state_lock` for control state) to avoid priority inversion
+The driver is built around the four real-time software engineering requirements:
 
-The car perceives the world through **two virtual cameras** (front + rear) streamed over TCP, runs an OpenCV vision pipeline, and sends `(steering, acceleration)` commands back to the simulator at 50 Hz.
+1. **Concurrency** - separate threads for front camera input, rear camera input, perception/decision making, and control output.
+2. **Task Periods** - fixed task periods with each task run in a periodic loop.
+3. **Task Priorities** - Windows thread priorities assigned using Deadline-Monotonic reasoning.
+4. **Shared-Resource Synchronisation** - split locks for frame data and control state to reduce blocking between camera I/O and actuation.
 
-Per the official poster (`game rule/RTSE_Poster_game.pdf`), the **Unity simulator is the authoritative state machine** — it owns score, speed, and event resolution. Our controller therefore keeps no shadow simulation; it reacts to what the cameras show, frame by frame.
+The car receives two virtual camera streams over TCP, processes them with OpenCV, and sends `(steering, acceleration)` commands back to the simulator at 50 Hz.
 
 ---
 
-## Game Rules (per poster)
+## Current Algorithm
 
-**Tokens (front-camera observations)**
+The controller uses a rule-based real-time perception and steering stack. It is deliberately deterministic and lightweight so the processing task can run near 30 Hz.
 
-| Colour | Game effect | Our steering reaction |
+### Perception Techniques
+
+| Component | Technique used |
+| --- | --- |
+| Image pre-processing | Resize camera frames to `320x240` for bounded processing cost. |
+| Colour segmentation | Pinned HSV ranges measured from game assets for red, green, yellow, police blue, and chasing-car teal. HSV auto-calibration code remains in the module but is currently disabled because the measured ranges are more stable. |
+| Road gating | Low-saturation asphalt mask filters colour contours so tokens must sit on the road, not on grass or sky. |
+| Orb detection | HSV mask plus contour filters: area, aspect ratio, circularity, fill ratio, and solidity. A relaxed on-road gate accepts large perspective-squashed close orbs. |
+| Orb distance | Inverse Perspective Mapping projects each orb's ground-contact point into a bird's-eye space. Smaller projected distance means the orb is nearer. |
+| Front police detection | Detects the police car ahead by the blue half of the red/blue livery, then verifies adjacent dark-red pixels. This rejects sky, signs, red tokens, and other blue noise. |
+| Rear chasing-car detection | Detects the teal chasing car from the rear camera, crops out the sky band, applies morphology, gates by area and centre band, then confirms it is catching up using smoothed area growth across recent frames. |
+| Lane offset | Canny + HoughLinesP on the lower front ROI estimates lane-centre offset for overlay/debug. The current steering policy does not use this as the default fallback. |
+| Lane curve | Bird's-eye warp, Sobel/V-channel lane-pixel mask, histogram bases, and sliding-window pixel collection estimate a `curve_bias` used as a small anticipatory steering bias while seeking green tokens. |
+| Hill/slope detection | Tracks the asphalt horizon using an EMA baseline. When the horizon deviates enough, the controller treats the road as a hill and triggers red/yellow evasion earlier. |
+| Low brightness | Mean V channel on a centre crop detects the low-light challenge. |
+
+### Steering and Control Priority
+
+The steering decision is ordered from highest priority to lowest:
+
+1. **Low brightness recovery** - if the front frame is dim, steering is set to `0.0` and acceleration is set to `-1.0` to reverse/recover visibility.
+2. **Front police car** - if the police car is close and centred, dodge away from it. Otherwise, seek a red token, preferring one on the opposite side of the police car. If no red token is visible, ease away from the police side.
+3. **Rear chasing car** - if the rear teal car is growing in area, commit to a forced lane change for `1.5 s`. The lane-change direction alternates on each trigger.
+4. **Nearest imminent orb** - if any orb is within the IPM action distance (`ORB_ACT_DISTANCE = 120`), the nearest orb drives the action. If a red/yellow hazard is almost as near as a green (`ORB_TIE_MARGIN = 25`), hazard avoidance wins.
+5. **Green token seek** - steer toward green. If the green is clearly in another lane, commit to a stronger lane change and hold briefly so flicker does not cancel the manoeuvre.
+6. **Red token avoidance** - when a red token is ahead, commit to a full lane-change away from it for `1.6 s`, then counter-steer briefly for `0.35 s` to settle.
+7. **Yellow token avoidance** - dodge yellow only when it is sufficiently close and inside the centre path band.
+8. **Default** - go straight with cruise throttle.
+
+Throttle policy:
+
+| Situation | Acceleration command |
+| --- | --- |
+| Normal driving | `0.8` |
+| Low brightness recovery | `-1.0` |
+
+Hill policy does not reduce throttle. It scales red/yellow trigger thresholds by `HILL_AREA_SCALE = 0.5`, causing earlier evasive steering when tokens appear late over a crest.
+
+---
+
+## Game Rules and Implemented Reactions
+
+| Game object/event | Camera signal | Current reaction |
 | --- | --- | --- |
-| Green | +10 % speed | **Attract** — gentle P-controller toward centroid |
-| Red | −20 % speed | **Avoid** — hard lane-change away (inverted to **seek** in police mode) |
-| Yellow | Random 1-of-5 corruption (next token hidden, tokens invisible 5 s, camera input delay 5 s, action output delay 5 s, corrupted camera input 5 s) | Avoid only if dead-centre — most yellow effects are temporary input corruption, not catastrophic |
-
-**Events (poster-listed, all observed directly from camera)**
-
-| Event | Signal | Reaction |
-| --- | --- | --- |
-| **Trailing car** | Growing high-saturation contour in rear cam | 1.5 s defensive swerve, direction alternates each trigger |
-| **Police** | Blue contour in rear cam | Flip red behaviour to **seek the next red token** (poster: "catch next red or −50 % speed") |
-| **Low brightness** | Mean V channel of front frame falls below threshold | Reduce throttle (`0.8 → 0.4`) — token visibility is degraded |
-
-Our software does **not** track score, speed, hit cooldowns, or yellow-event outcomes — those are the game's job.
+| Green token | Green on-road orb in front camera | Seek/grab using proportional steering or committed lane change. |
+| Red token | Red on-road orb in front camera | Avoid with committed lane change, except during police handling where red is sought to escape. |
+| Yellow token | Yellow on-road orb in front camera | Avoid only when close and centred. |
+| Chasing car | Teal car in rear camera with growing area | Forced lane change, alternating direction per trigger. |
+| Police car | Red/blue police livery in front camera | Dodge if collision risk is high; otherwise seek a red token. |
+| Low brightness | Low mean V channel in front centre crop | Reverse with straight steering to recover. |
+| Hill/crest | Asphalt horizon deviates from flat-road EMA baseline | Trigger red/yellow avoidance earlier. |
 
 ---
 
 ## Real-Time Architecture
 
-### Tasks (Deadline-Monotonic schedule)
+### Tasks
 
 | Task | Period | Priority | Role |
 | --- | --- | --- | --- |
-| `ReadFrontCamera` | 5 ms | HIGH | TCP frame decode — collision-critical input |
-| `SendControls` | 20 ms | HIGH | Non-blocking send of `(steering, accel)` (50 Hz) — hard actuator deadline |
-| `Processing` | 33 ms | MEDIUM | OpenCV perception + steering decision (~30 Hz) — the "brain" |
-| `ReadBackCamera` | 50 ms | LOW | TCP frame decode; rear threats (police / trailing car) evolve slowly |
+| `ReadFrontCamera` | 5 ms | HIGH | Decode the latest front TCP frame; collision-critical input. |
+| `SendControls` | 20 ms | HIGH | Send `(steering, accel)` at 50 Hz; actuator deadline. |
+| `Processing` | 33 ms | MEDIUM | Run perception and compute steering/throttle at about 30 Hz. |
+| `ReadBackCamera` | 50 ms | LOW | Decode rear frames for the slower chasing-car signal. |
 
-Priority tracks **deadline criticality**, not raw period (Deadline-Monotonic). The rear
-camera runs at 20 Hz so its `LOW` priority is the *longest-deadline* task — keeping the
-schedule coherent (longest deadline → lowest priority) and avoiding priority inversion on
-`data_lock` against the `HIGH` front camera. Camera reads call the skeleton's
-`read_*_camera_task` directly — input corruption / delay is the game's responsibility,
-so we do not throttle our own reads on top of it.
+Priorities follow Deadline-Monotonic scheduling: shorter and more critical deadlines get higher priority. The rear camera is lowest priority because rear threats evolve more slowly and its deadline is longest.
 
-### Steering Priority Stack (highest wins)
-1. **Police-seek** — if rear cam sees blue **and** front cam has a red, steer toward the red (poster: "catch next red or −50 % speed")
-2. **Red avoid swerve** — early-trigger (`area ≥ 1.0 %`, wide band 70 %), 1.6 s commit + 0.35 s counter-steer settle, direction-flip if re-threatened
-3. **Trailing-car forced swerve** — single timer armed when rear cam shows a growing high-saturation contour; alternates direction each trigger
-4. **Yellow avoid** — only if centred (`area ≥ 2.0 %`, band 55 %)
-5. **Green attract** — P-controller on centroid offset
-6. **Lane follow** — Canny + HoughLinesP on bottom ROI
-7. Default `0.0`
+### Synchronisation
 
-Throttle is a one-line policy: `LOW_BRIGHTNESS_THROTTLE (0.4)` if the front frame is dim, otherwise `CRUISE_THROTTLE (0.8)`.
+The controller uses two locks:
 
-### Perception Pipeline (`image_detection.py`)
-- **HSV auto-calibration** via k-means clustering over the first ~3 s of front-cam frames (no hand-tuned colour constants)
-- **Orb shape gate** — area / aspect-ratio / circularity (`4πA/P² ≥ 0.60`) / fill-ratio (`≥ 0.65`) filters reject lane markings, grass, sky
-- **ROI tightening** — top `0.28`, sides `0.15` to handle uphill orbs while ignoring shoulders
-- **Low-brightness detector** — mean V channel on a centre crop (HUD-bias-free)
-- **Frame-snapshot pattern** — `processing_task` grabs frame refs under `data_lock`, releases, then runs the ~10–20 ms CV pipeline lock-free
+| Lock | Protects | Reason |
+| --- | --- | --- |
+| `data_lock` | Latest front/rear frame slots | Camera tasks can update frames without touching command state. |
+| `state_lock` | Steering, acceleration, and perception snapshots | Control output can read commands separately from camera I/O. |
+
+`processing_task` snapshots frame references under `data_lock`, releases the lock, then runs the OpenCV pipeline lock-free. `send_controls_task` uses `state_lock.acquire(blocking=False)`; if the processing task is mid-write, it reuses the last successfully sent command to preserve the 50 Hz output deadline.
 
 ---
 
 ## Repository Layout
 
-```
+```text
 DAMM_RTSE_ASGMT2/
-├── README.md                — this file
-├── plan.md                  — design plan + tuning iteration log (historical, see Phase 3 postscript)
-├── imagedetection.md        — perception improvement backlog (grounded in screenshot/)
-├── requirements.txt         — opencv-python, numpy, keyboard
-├── sample_drive.py          — controller + RT scheduling (editable + locked sections)
-├── image_detection.py       — OpenCV perception module (HSV calib, contour filters, lane, brightness, overlay)
-├── test_communication.py    — WASD manual-control reference client
-├── SpeedTrials2D/           — Unity build of the competition game
-│   └── SpeedTrials2D.exe
-├── game rule/
-│   └── RTSE_Poster_game.pdf — official rules poster (authoritative spec)
-└── screenshot/              — runtime captures of the Perception HUD
+|-- README.md                 - this file
+|-- sample_drive.py           - runnable entrypoint, RT scheduling, TCP I/O, locks, task wiring
+|-- control_policy.py         - steering/throttle decisions and manoeuvre latches
+|-- perception_pipeline.py    - perception call order and data bundle for the controller
+|-- display_overlay.py        - OpenCV perception and lane-curve debug windows
+|-- image_detection.py        - raw OpenCV perception algorithms
+|-- test_communication.py     - WASD manual-control reference client
+|-- requirements.txt          - Python dependencies
+|-- task1.md                  - planned confidence-gating/temporal-filtering task
+|-- plan.md                   - design notes and tuning history
+|-- imagedetection.md         - perception improvement notes
+|-- game rule/
+|   |-- RTSE_Poster_game.pdf  - assignment/game rule poster
+|   `-- police.jpg            - police colour reference image
+|-- screenshot/               - runtime perception screenshots
+|-- video/                    - captured frame sequences used for tuning
+|-- SpeedTrials2D/            - current Unity simulator build
+|-- SpeedTrials2D_v1/         - older simulator build
+`-- SpeedTrials2D_v2/         - alternate simulator build
 ```
 
 ---
 
 ## How to Run
 
-**Prerequisites:** Python 3.10+, Windows (game is a Unity Windows build).
+**Prerequisites:** Python 3.10+ on Windows.
 
 ```powershell
 # 1. Install dependencies
 pip install -r requirements.txt
 
-# 2. Start the simulator (opens TCP camera + control sockets)
+# 2. Start the simulator
 .\SpeedTrials2D\SpeedTrials2D.exe
 
 # 3. In a separate terminal, launch the autonomous driver
 python sample_drive.py
 ```
 
-A `Perception` window opens showing the front/rear view, detected orbs, lane lines, and a HUD line:
+The driver opens these OpenCV windows:
 
-```
-target=80 eff=80 police=0 events=[] str=0.00 acc=0.80
+| Window | Purpose |
+| --- | --- |
+| `Front Camera` | Raw front-camera stream from the skeleton reader. |
+| `Back Camera` | Raw rear-camera stream from the skeleton reader. |
+| `Perception` | Front/rear perception overlay, detected objects, nearest-orb marker, and command HUD. |
+| `Lane Curve` | Bird's-eye lane-curve debug panel. |
+
+Example HUD:
+
+```text
+target=80 eff=80 police=0 events=['NEAR:G d=92']
+str=+0.54 acc=+0.80
 ```
 
-`target` / `eff` are the chosen throttle × 100 (`CRUISE_THROTTLE = 0.8`, dropping to `0.4` under low brightness). `events` lists what perception is currently reacting to: `TRAILING_CAR`, `POLICE`, `LOW_LIGHT`.
+`events` can include `POLICE->GRAB_RED`, `CHASING_CAR`, `HILL`, and `NEAR:<colour> d=<distance>`.
 
 Press `Ctrl+C` in the terminal to shut down cleanly.
 
-### Manual-control fallback
+### Manual-Control Fallback
 
-To drive with the keyboard for testing the communication path:
+To test the communication path without the autonomous controller:
 
 ```powershell
 python test_communication.py
@@ -153,28 +194,45 @@ Controls: `W/S` accelerate/brake, `A/D` steer, `Q` quit.
 
 ## Editable vs Locked Code Regions
 
-Per the assignment skeleton, the following sections of `sample_drive.py` are **locked** and must not be modified:
+Per the assignment skeleton, the following sections of `sample_drive.py` are treated as locked:
+
 - `Configuration` constants
 - `Real-Time Scheduling Framework` (`TaskPriority`, `RTTask`)
 - `Network Connection Setup` (`setup_cameras`, `setup_control_server`)
 - Body of `read_single_camera`
 - `__main__` shutdown block
 
-Our work lives in the **editable** regions:
-- `shared_data` key extensions (kept minimal — just frame slots + control commands + perception snapshots)
-- New module `image_detection.py` containing all perception
-- Body of `processing_task` and `send_controls_task` in `sample_drive.py`
-- Period / priority arguments inside `RTTask(...)` constructors
+Our implementation lives in the editable regions and supporting modules:
+
+- `shared_data` key extensions for frame slots, control commands, and perception snapshots
+- `image_detection.py` for raw perception algorithms
+- `control_policy.py` for autonomous driving decisions
+- `perception_pipeline.py` for perception orchestration
+- `display_overlay.py` for UI/debug rendering
+- `processing_task` and `send_controls_task` integration in `sample_drive.py`
+- `RTTask(...)` period and priority arguments
+
+---
+
+## 4-Person Ownership Split
+
+| Owner | Main files | Responsibility |
+| --- | --- | --- |
+| Person 1 | `sample_drive.py` | RT scheduling, task periods/priorities, sockets, locks, shared-state integration, and `send_controls_task`. |
+| Person 2 | `image_detection.py` | Raw OpenCV algorithms: HSV masks, orb detection, police/chasing-car detection, lane, hill, and brightness detection. |
+| Person 3 | `perception_pipeline.py`, `display_overlay.py` | Perception orchestration, HUD packaging, and OpenCV debug windows. |
+| Person 4 | `control_policy.py` | Steering/throttle policy, police handling, chasing-car swerve, nearest-orb priority, and manoeuvre latches. |
 
 ---
 
 ## Key Engineering Decisions
 
-- **Pure-perception model** — no shadow simulation of game state (no software-tracked score, speed, cooldowns, or yellow-event outcomes). The Unity game is authoritative; the controller only reacts to what cameras show this frame. Removed the previous event-engine layer (~80 lines) once the official poster confirmed this is the intended model.
-- **Perception in its own module** — `image_detection.py` owns HSV calibration, contour shape filters, lane offset, brightness check, and overlay rendering, so the controller stays focused on RT concerns.
-- **Split locks** — `data_lock` scoped to frame slots only; `state_lock` protects command writes. Camera threads never block on control state.
-- **Non-blocking control fallback** — `send_controls_task` uses `state_lock.acquire(blocking=False)`; if busy, it re-sends the last `(steering, accel)`. Classic RT priority-inversion mitigation that keeps the 50 Hz deadline solid.
-- **Monotonic clocks** — `time.monotonic()` for the trailing-car swerve timer and red-avoid latch (skeleton's `time.time()` left untouched).
-- **One perception window at 30 Hz** instead of the skeleton's per-camera `imshow` at 200 Hz — cuts `cv2.waitKey` overhead from ~400 ms/s to ~30 ms/s.
-
-See [`plan.md`](./plan.md) for design history (note: phases 1–2 describe the previous shadow-state design — superseded by the Phase 3 postscript), and [`imagedetection.md`](./imagedetection.md) for the perception improvement backlog grounded in `screenshot/`.
+- **Pure perception model** - no duplicated game-state simulation. The controller reacts only to camera evidence.
+- **Low-risk module split** - `sample_drive.py` remains the assignment entrypoint while editable logic is divided by ownership.
+- **Pinned HSV ranges** - measured game-asset colours are more stable than live auto-calibration for this simulator.
+- **Road-gated orb detection** - colour alone is not trusted; token contours must be plausible on-road blobs.
+- **Imminence-first steering** - bird's-eye distance lets the nearest dangerous object override simple colour priority.
+- **Committed manoeuvre latches** - red avoidance, green seeking, and chasing-car lane changes hold long enough to complete a lane transition despite momentary detection flicker.
+- **Front-camera police handling** - the current V2.0 police challenge is handled as a front obstacle, not a rear event.
+- **Low-light reverse recovery** - dim frames cause a straight reverse command instead of merely slowing down.
+- **Split locks and non-blocking control send** - reduces priority-inversion risk and keeps actuator output periodic.

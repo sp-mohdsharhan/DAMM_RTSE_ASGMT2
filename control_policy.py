@@ -29,6 +29,7 @@ from image_detection import (
     YELLOW_AVOID_AREA_FRAC,
     YELLOW_AVOID_GAIN,
 )
+from perception_types import FrontPerception, RearPerception
 
 
 CRUISE_THROTTLE = 0.8
@@ -47,8 +48,14 @@ _lane_change_until = 0.0
 _lane_change_dir = 1
 
 
-def _compute_steering(front_per, curve_bias, hill, now,
-                      force_lane_change=False, swerve_dir=1):
+def _compute_steering(
+    front_per: FrontPerception | None,
+    curve_bias: float,
+    hill: bool,
+    now: float,
+    force_lane_change: bool = False,
+    swerve_dir: int = 1,
+) -> float:
     """Return steering in -1..+1.
 
     Priority: front police, rear chasing-car swerve, imminent nearest orb,
@@ -178,7 +185,14 @@ def _compute_steering(front_per, curve_bias, hill, now,
     return 0.0
 
 
-def compute_control(front_per, rear_per, curve_bias, hill, low_light, now):
+def compute_control(
+    front_per: FrontPerception | None,
+    rear_per: RearPerception | None,
+    curve_bias: float,
+    hill: bool,
+    low_light: bool,
+    now: float,
+) -> tuple[float, float, list[str]]:
     """Return (steering, accel, events_visible) for the current perception frame."""
     global _lane_change_until, _lane_change_dir
 

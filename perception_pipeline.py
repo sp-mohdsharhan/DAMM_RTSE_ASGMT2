@@ -15,9 +15,10 @@ from image_detection import (
     detect_rear,
     detect_slope,
 )
+from perception_types import PerceptionResult
 
 
-def run_perception(front_frame, back_frame):
+def run_perception(front_frame, back_frame) -> PerceptionResult:
     """Run one lock-free perception cycle.
 
     Returns:

@@ -3,9 +3,16 @@
 import cv2
 
 from image_detection import draw_lane_curve_debug, draw_overlay
+from perception_types import CurveDebug, FrontPerception, HudData, RearPerception
 
 
-def show_perception(front_per, rear_per, lane_offset, curve_dbg, hud):
+def show_perception(
+    front_per: FrontPerception | None,
+    rear_per: RearPerception | None,
+    lane_offset: float | None,
+    curve_dbg: CurveDebug | None,
+    hud: HudData,
+) -> None:
     """Render perception and lane-curve debug windows.
 
     Display is best-effort so UI failures do not stop the real-time tasks.

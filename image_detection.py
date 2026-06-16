@@ -52,6 +52,11 @@ ORB_MIN_ASPECT = 0.70                    # near-square only (rejects dash rectan
 ORB_MAX_ASPECT = 1.45
 ORB_MIN_CIRCULARITY = 0.60               # 4*pi*A/P^2 — true orbs ~0.75+, dashes <0.5
 ORB_MIN_FILL_RATIO = 0.65                # area / bbox_area; circles fill ~0.78, dashes <0.5
+# Solidity = contour_area / convex_hull_area. An orb (even a perspective-squashed
+# oval) is convex -> ~0.92-0.98; red curb strips / L-bends along the lane edge
+# have notches & concavities -> well below this. Convexity survives perspective,
+# so the SAME floor is used for the strict and the relaxed road gate below.
+ORB_MIN_SOLIDITY = 0.88                  # reject red lane-edge / curb false positives
 
 # Relaxed gate for ON-ROAD orbs. Once detection is restricted to the asphalt
 # region (grass is excluded by the road mask, not by strict shape rules), we can
@@ -62,6 +67,7 @@ ORB_ROAD_MIN_ASPECT = 0.45              # accept ovals (taller-than-wide)
 ORB_ROAD_MAX_ASPECT = 2.10              # accept ovals (wider-than-tall)
 ORB_ROAD_MIN_CIRCULARITY = 0.45         # ellipses score lower than circles
 ORB_ROAD_MIN_FILL_RATIO = 0.55          # ellipse fills its bbox a bit less than a circle
+ORB_ROAD_MIN_SOLIDITY = 0.88            # convexity floor (same as strict): kills curb strips
 
 # Road-region mask thresholds (asphalt = low-saturation grey).
 # Measured asphalt: S~0-75, V~60-100. SAT_MAX 85 captures near-road (S~75) while
@@ -164,6 +170,20 @@ HSV_CHASING = (np.array([78, 120, 40]), np.array([98, 255, 255]))
 POLICE_DODGE_AREA = 0.04
 POLICE_DODGE_BAND = 0.50
 
+# Police detection hardening (Challenge 3).
+POLICE_MIN_AREA_PX = 120             # smallest pixel area to accept (reject distant specks)
+POLICE_MIN_AREA_FRAC = 0.008         # roi-fraction floor (rejects tiny / far-off blobs)
+POLICE_RED_VERIFY_RATIO = 0.15       # dark-red pixels in search box must be >= this * blue_area
+POLICE_VERIFY_PAD_X_FRAC = 1.0       # search-box width  = +/- 1.0 * blue bbox width
+POLICE_VERIFY_PAD_Y_FRAC = 0.5       # search-box height = +/- 0.5 * blue bbox height
+
+# Chasing-car detection hardening (Challenge 2).
+CHASING_MIN_AREA_FRAC = 0.012        # below this the car is too far away to matter
+CHASING_CENTER_BAND_FRAC = 0.75      # ignore teal blobs on the far shoulder
+CHASING_GROW_DELTA = 0.006           # total area_frac increase across smoothing window
+CHASING_HIST_LEN = 4                 # frames of area history used for smoothed growth
+CHASING_MIN_GROW_FRAMES = 3          # minimum history frames before "growing" can fire
+
 # Mutable active HSV ranges (list-of-(lo,hi) per color), consulted by detectors.
 # All orb colours are pinned (calibration off); police is pinned too.
 _hsv_active = {
@@ -243,7 +263,8 @@ def _orb_contours_info(mask, roi_area, roi_x0=0, roi_y0=0, road_mask=None,
                        max_area_frac=ORB_MAX_AREA_FRAC,
                        min_aspect=ORB_MIN_ASPECT, max_aspect=ORB_MAX_ASPECT,
                        min_circularity=ORB_MIN_CIRCULARITY,
-                       min_fill=ORB_MIN_FILL_RATIO):
+                       min_fill=ORB_MIN_FILL_RATIO,
+                       min_solidity=ORB_MIN_SOLIDITY):
     """Return a LIST of orb dicts (one per qualifying contour), or [].
     Shape filters (aspect, circularity, fill, max-area) reject grass strips /
     road markings; road_mask (ROI coords) keeps only orbs whose centroid is on
@@ -280,6 +301,9 @@ def _orb_contours_info(mask, roi_area, roi_x0=0, roi_y0=0, road_mask=None,
         bbox_area = float(w * h)
         if bbox_area <= 0 or (area / bbox_area) < min_fill:
             continue                                  # sparse/hollow (dashed stripe)
+        hull_area = cv2.contourArea(cv2.convexHull(c))
+        if hull_area <= 0 or (area / hull_area) < min_solidity:
+            continue                                  # concave -> red curb / lane-edge strip
         if road_mask is not None:                     # must sit ON the road
             cxr = min(rw - 1, max(0, int(x + w / 2.0)))
             cyr = min(rh - 1, max(0, int(y + h / 2.0)))
@@ -330,7 +354,8 @@ def detect_front_objects(frame):
                     max_area_frac=ORB_ROAD_MAX_AREA_FRAC,
                     min_aspect=ORB_ROAD_MIN_ASPECT, max_aspect=ORB_ROAD_MAX_ASPECT,
                     min_circularity=ORB_ROAD_MIN_CIRCULARITY,
-                    min_fill=ORB_ROAD_MIN_FILL_RATIO)
+                    min_fill=ORB_ROAD_MIN_FILL_RATIO,
+                    min_solidity=ORB_ROAD_MIN_SOLIDITY)
     else:
         gate = {}                                     # strict defaults (grass-safe)
 
@@ -347,10 +372,9 @@ def detect_front_objects(frame):
     def _nearest(lst):
         return min(lst, key=lambda o: o['distance']) if lst else None
 
-    # Police car ahead (Challenge 3): blue half (HSV_POLICE). It's a car, not an
-    # orb, so detect it as a blob. Its dark-red half (V~108) is below the red orb
-    # V floor (120) so it is NOT picked up as a grabbable red token.
-    police = _largest_blob(_color_mask(hsv, *_hsv_active['police']), roi_area, roi_x0)
+    # Police car ahead (Challenge 3): verify by the unique red+blue split livery
+    # (road-gated, min-area floored, dark-red adjacency confirmed).
+    police = _detect_police(hsv, road, roi_area, roi_x0)
 
     return {
         'frame': small,
@@ -393,33 +417,106 @@ def _largest_blob(mask, roi_area, roi_x0=0, min_area_px=ORB_MIN_AREA_PX):
     }
 
 
-# Chasing-car growth tracker (frame-over-frame area increase = approaching).
-_prev_other_area = 0.0
+def _detect_police(hsv, road_mask, roi_area, roi_x0=0):
+    """Confirm a police car by its unique red+blue split livery.
+
+    The blue half is the primary detection; we then verify that dark-red pixels
+    sit immediately adjacent to it. This rejects sky / blue signs / red orbs /
+    tail-lights — none of which co-occur with both halves simultaneously.
+    Also gates the blue blob on the road mask so sky patches can't win."""
+    blue_mask = _color_mask(hsv, *_hsv_active['police'])
+    if blue_mask is None:
+        return None
+    if road_mask is not None:                        # must sit on the asphalt
+        blue_mask = cv2.bitwise_and(blue_mask, road_mask)
+
+    contours, _ = cv2.findContours(blue_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    best, best_area = None, 0.0
+    for c in contours:
+        a = cv2.contourArea(c)
+        if a >= POLICE_MIN_AREA_PX and a > best_area:
+            best, best_area = c, a
+    if best is None or (best_area / roi_area) < POLICE_MIN_AREA_FRAC:
+        return None
+
+    bx, by, bw, bh = cv2.boundingRect(best)
+
+    # Verify dark-red half is adjacent to the blue blob.
+    # Police red is dark (V <= ~170) vs bright red orbs (V >= 193), so a
+    # low-V red mask is used — it won't mis-fire on grabbable orbs.
+    pad_x = int(bw * POLICE_VERIFY_PAD_X_FRAC)
+    pad_y = int(bh * POLICE_VERIFY_PAD_Y_FRAC)
+    sx = max(0, bx - pad_x)
+    sy = max(0, by - pad_y)
+    ex = min(hsv.shape[1], bx + bw + pad_x)
+    ey = min(hsv.shape[0], by + bh + pad_y)
+    region = hsv[sy:ey, sx:ex]
+    rh = region[:, :, 0]
+    rs = region[:, :, 1]
+    rv = region[:, :, 2]
+    dark_red = (((rh <= 10) | (rh >= 165)) & (rs >= 120) & (rv >= 40) & (rv <= 170))
+    if dark_red.sum() < best_area * POLICE_RED_VERIFY_RATIO:
+        return None
+
+    cx = bx + bw / 2.0 + roi_x0
+    cy = by + bh / 2.0
+    return {
+        'bbox': (int(bx + roi_x0), int(by), int(bw), int(bh)),
+        'circle': (int(cx), int(cy), int(np.sqrt(best_area / np.pi))),
+        'area_frac': float(best_area) / float(roi_area),
+        'centroid_x_norm': (cx - PROC_W / 2.0) / (PROC_W / 2.0),
+        'centroid_y': float(cy),
+    }
+
+
+# Chasing-car smoothed area history for robust growth detection.
+_chasing_area_hist = []
 
 
 def detect_rear(frame):
     """Rear-camera CHASING CAR (V2.0 Challenge 2). Returns
        {'frame', 'other_car': {'info', 'growing'}}.
-    The chasing car is the TEAL car (HSV_CHASING) — pinning its colour means sky,
-    buildings, and rear-floating orbs no longer register as a car (the old
-    "any saturated blob" approach false-fired on all of them). 'growing' = its
-    area is increasing frame-over-frame (it's catching up). (Police is NOT here —
-    it appears in the FRONT camera; see detect_front_objects.)"""
-    global _prev_other_area
+
+    Hardening over the previous version:
+      * Crops the top REAR_SKY_FRAC band so sky / buildings can't fire as teal.
+      * Requires CHASING_MIN_AREA_FRAC -> distant specks are ignored.
+      * Requires |centroid_x_norm| < CHASING_CENTER_BAND_FRAC -> far-shoulder
+        teal blobs (road barriers, signs) do not trigger a swerve.
+      * 'growing' uses a CHASING_HIST_LEN-frame smoothed area window so a single
+        noisy frame can't arm it and a single missed frame can't reset it.
+    """
+    global _chasing_area_hist
     small = cv2.resize(frame, (PROC_W, PROC_H))
-    roi_area = PROC_W * PROC_H
-    hsv = cv2.cvtColor(small, cv2.COLOR_BGR2HSV)
+    roi_y0 = int(PROC_H * REAR_SKY_FRAC)            # drop sky / building band
+    roi = small[roi_y0:, :]
+    roi_area = roi.shape[0] * roi.shape[1]
+    hsv = cv2.cvtColor(roi, cv2.COLOR_BGR2HSV)
 
     teal = _color_mask(hsv, *_hsv_active['chasing'])
     if teal is not None:
-        teal = cv2.morphologyEx(teal, cv2.MORPH_OPEN, np.ones((5, 5), np.uint8))
+        teal = cv2.morphologyEx(teal, cv2.MORPH_OPEN,  np.ones((5, 5), np.uint8))
+        teal = cv2.morphologyEx(teal, cv2.MORPH_CLOSE, np.ones((7, 7), np.uint8))
     other = _largest_blob(teal, roi_area)
-    growing = False
+
+    # Shift y coords back to full-frame so overlay draws correctly.
     if other is not None:
-        growing = other['area_frac'] > _prev_other_area + 0.005 and other['area_frac'] > 0.02
-        _prev_other_area = other['area_frac']
+        bx, by, bw, bh = other['bbox']
+        other['bbox'] = (bx, by + roi_y0, bw, bh)
+        ccx, ccy, cr = other['circle']
+        other['circle'] = (ccx, ccy + roi_y0, cr)
+        other['centroid_y'] = float(other['centroid_y'] + roi_y0)
+
+    growing = False
+    if (other is not None
+            and other['area_frac'] > CHASING_MIN_AREA_FRAC
+            and abs(other['centroid_x_norm']) < CHASING_CENTER_BAND_FRAC):
+        _chasing_area_hist.append(other['area_frac'])
+        if len(_chasing_area_hist) > CHASING_HIST_LEN:
+            _chasing_area_hist.pop(0)
+        if len(_chasing_area_hist) >= CHASING_MIN_GROW_FRAMES:
+            growing = (_chasing_area_hist[-1] - _chasing_area_hist[0]) > CHASING_GROW_DELTA
     else:
-        _prev_other_area = 0.0
+        _chasing_area_hist.clear()
 
     return {
         'frame': small,

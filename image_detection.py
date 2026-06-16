@@ -34,7 +34,24 @@ PUBLIC SURFACE (everything below is consumed by sample_drive.py):
 
 import cv2
 import numpy as np
+from ultralytics import YOLO
 
+# ---------------------------------------------------------------------------
+# Detection mode
+# ---------------------------------------------------------------------------
+
+DETECTION_MODE = "YOLO"      # "HSV" or "YOLO"
+YOLO_MODEL_PATH = "yolo/best.pt"
+
+_yolo_model = None
+
+def _get_yolo_model():
+    global _yolo_model
+
+    if _yolo_model is None:
+        _yolo_model = YOLO(YOLO_MODEL_PATH)
+
+    return _yolo_model
 
 # ---------------------------------------------------------------------------
 # Tunable constants

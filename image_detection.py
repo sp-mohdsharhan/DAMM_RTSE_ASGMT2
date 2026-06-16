@@ -34,7 +34,27 @@ PUBLIC SURFACE (everything below is consumed by sample_drive.py):
 
 import cv2
 import numpy as np
+from ultralytics import YOLO
 
+# ---------------------------------------------------------------------------
+# Detection mode
+# ---------------------------------------------------------------------------
+
+DETECTION_MODE = "HSV"      # "HSV" or "YOLO"
+YOLO_MODEL_PATH = "yolo/best.pt"
+
+_yolo_frame_counter = 0
+_last_yolo_result = None
+
+_yolo_model = None
+
+def _get_yolo_model():
+    global _yolo_model
+
+    if _yolo_model is None:
+        _yolo_model = YOLO(YOLO_MODEL_PATH)
+
+    return _yolo_model
 
 # ---------------------------------------------------------------------------
 # Tunable constants
@@ -332,6 +352,117 @@ def _orb_contours_info(mask, roi_area, roi_x0=0, roi_y0=0, road_mask=None,
 
 
 def detect_front_objects(frame):
+
+    if DETECTION_MODE == "YOLO":
+        return detect_front_objects_yolo(frame)
+
+    return detect_front_objects_hsv(frame)
+
+def detect_front_objects_yolo(frame):
+
+    global _yolo_frame_counter
+    global _last_yolo_result
+
+    _yolo_frame_counter += 1
+
+    # Run YOLO every 2 frames
+    if _yolo_frame_counter % 2 != 0 and _last_yolo_result is not None:
+        return _last_yolo_result
+
+    model = _get_yolo_model()
+
+    small = cv2.resize(frame, (PROC_W, PROC_H))
+
+    results = model.predict(
+        small,
+        conf=0.40,
+        verbose=False
+    )
+
+    reds = []
+    greens = []
+    yellows = []
+    police_list = []
+
+    for result in results:
+
+        for box in result.boxes:
+
+            cls_id = int(box.cls[0])
+            cls_name = model.names[cls_id]
+
+            x1, y1, x2, y2 = map(int, box.xyxy[0])
+
+            w = x2 - x1
+            h = y2 - y1
+
+            area_frac = (w * h) / float(PROC_W * PROC_H)
+
+            obj = {
+                'bbox': (x1, y1, w, h),
+                'circle': (
+                    int((x1 + x2) / 2),
+                    int((y1 + y2) / 2),
+                    int(max(w, h) / 2)
+                ),
+                'area_frac': area_frac,
+                'centroid_x_norm':
+                    (((x1 + x2) / 2) - PROC_W / 2.0)
+                    / (PROC_W / 2.0),
+                'centroid_y': float((y1 + y2) / 2),
+
+                # closer objects appear lower in image
+                'distance': float(PROC_H - y2),
+
+                'color': cls_name
+            }
+
+            if cls_name == "red":
+                reds.append(obj)
+
+            elif cls_name == "green":
+                greens.append(obj)
+
+            elif cls_name == "yellow":
+                yellows.append(obj)
+
+            elif cls_name == "police":
+                police_list.append(obj)
+
+    all_orbs = reds + greens + yellows
+
+    all_orbs.sort(key=lambda x: x['distance'])
+
+    return {
+        'frame': small,
+        'roi_y0': 0,
+        'roi_x0': 0,
+        'road_mask': None,
+
+        'red':
+            min(reds, key=lambda x: x['distance'])
+            if reds else None,
+
+        'green':
+            min(greens, key=lambda x: x['distance'])
+            if greens else None,
+
+        'yellow':
+            min(yellows, key=lambda x: x['distance'])
+            if yellows else None,
+
+        'police':
+            min(police_list, key=lambda x: x['distance'])
+            if police_list else None,
+
+        'orbs': all_orbs,
+
+        'nearest':
+            all_orbs[0]
+            if all_orbs else None
+    }
+
+def detect_front_objects_hsv(frame):
     """Return dict {'frame','roi_y0','roi_x0','road_mask','red','green','yellow','orbs','nearest'}.
 
     Orbs are detected ON the asphalt only (road-region mask gates the colour
@@ -474,6 +605,68 @@ _chasing_area_hist = []
 
 
 def detect_rear(frame):
+
+    if DETECTION_MODE == "YOLO":
+        return detect_rear_yolo(frame)
+
+    return detect_rear_hsv(frame)
+
+def detect_rear_yolo(frame):
+
+    model = _get_yolo_model()
+
+    small = cv2.resize(frame, (PROC_W, PROC_H))
+
+    results = model.predict(
+        small,
+        conf=0.40,
+        verbose=False
+    )
+
+    other = None
+
+    for result in results:
+
+        for box in result.boxes:
+
+            cls_id = int(box.cls[0])
+            cls_name = model.names[cls_id]
+
+            #
+            # Rear-camera only cares about chasing cars
+            #
+            if cls_name not in ("car", "other_car", "chasing_car"):
+                continue
+
+            x1, y1, x2, y2 = map(int, box.xyxy[0])
+
+            w = x2 - x1
+            h = y2 - y1
+
+            area_frac = (w * h) / float(PROC_W * PROC_H)
+
+            candidate = {
+                'bbox': (x1, y1, w, h),
+                'circle': (
+                    int((x1 + x2) / 2),
+                    int((y1 + y2) / 2),
+                    int(max(w, h) / 2)
+                ),
+                'area_frac': area_frac,
+                'centroid_x_norm':
+                    (((x1 + x2) / 2) - PROC_W / 2.0)
+                    / (PROC_W / 2.0),
+                'centroid_y': float((y1 + y2) / 2),
+                'distance': float(PROC_H - y2),
+            }
+
+            #
+            # Keep nearest/largest car
+            #
+            if other is None or candidate['area_frac'] > other['area_frac']:
+                other = candidate
+
+def detect_rear_hsv(frame):
     """Rear-camera CHASING CAR (V2.0 Challenge 2). Returns
        {'frame', 'other_car': {'info', 'growing'}}.
 
@@ -844,10 +1037,22 @@ def detect_low_brightness(frame):
     Uses mean V on a centre crop so HUD overlays don't bias the result."""
     if frame is None:
         return False
+        
     h, w = frame.shape[:2]
     crop = frame[h // 4: h * 3 // 4, w // 4: w * 3 // 4]
+
     hsv = cv2.cvtColor(crop, cv2.COLOR_BGR2HSV)
-    return float(hsv[:, :, 2].mean()) < LOW_BRIGHTNESS_THRESHOLD
+    mean_v = float(hsv[:, :, 2].mean())
+
+    is_low = mean_v < LOW_BRIGHTNESS_THRESHOLD
+
+    print(
+        f"[LOW_BRIGHTNESS] Mean V={mean_v:.1f} "
+        f"Threshold={LOW_BRIGHTNESS_THRESHOLD} "
+        f"Detected={is_low}"
+    )
+
+    return is_low
 
 
 # ---------------------------------------------------------------------------

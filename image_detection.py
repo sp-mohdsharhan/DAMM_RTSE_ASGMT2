@@ -130,7 +130,7 @@ SLOPE_CENTER_BAND = (0.30, 0.70)         # center column fraction used to locate
 SLOPE_GAP_TOL = 8                        # rows of non-road (lane dashes) tolerated before the road top
 
 # Low-brightness event detection (poster: "low brightness — turn light on or all tokens yellow")
-LOW_BRIGHTNESS_THRESHOLD = 50            # mean V channel below this -> consider it dim
+LOW_BRIGHTNESS_THRESHOLD = 45            # mean V channel below this -> consider it dim
 
 # ---------------------------------------------------------------------------
 # HSV ranges & auto-calibration state

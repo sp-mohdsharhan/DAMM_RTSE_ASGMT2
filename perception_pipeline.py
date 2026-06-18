@@ -5,6 +5,9 @@ the order in which they are called and the compact data bundle consumed by the
 driving policy and display layer.
 """
 
+import os
+import time
+
 from image_detection import (
     calibrate_step,
     calibration_done,
@@ -18,6 +21,66 @@ from image_detection import (
     infer_golden_lane_from_tokens,
 )
 from perception_types import PerceptionResult
+
+
+LANE_GRID_LOG_ENABLED = True
+LANE_GRID_LOG_INTERVAL_S = 0.5
+LANE_GRID_LOG_PATH = os.path.join('logs', 'lane_grid.log')
+_lane_grid_log_state = {'last_at': 0.0, 'init': False}
+
+
+def _log_lane_grid(lane_grid, golden, curve_bias):
+    """Rate-limited lane-numbering log for Golden Lane validation."""
+    if not LANE_GRID_LOG_ENABLED:
+        return
+
+    now = time.monotonic()
+    if now - _lane_grid_log_state['last_at'] < LANE_GRID_LOG_INTERVAL_S:
+        return
+    _lane_grid_log_state['last_at'] = now
+
+    try:
+        os.makedirs(os.path.dirname(LANE_GRID_LOG_PATH), exist_ok=True)
+        ts = time.strftime('%H:%M:%S')
+        mode = 'w' if not _lane_grid_log_state['init'] else 'a'
+        with open(LANE_GRID_LOG_PATH, mode, encoding='utf-8') as fh:
+            if not _lane_grid_log_state['init']:
+                fh.write(f"# Lane grid log (session started {ts})\n")
+                fh.write(
+                    "# time  grid  car_lane  road_left/right  centers_norm  "
+                    "confidence  measured_left/right  held  golden_active  "
+                    "golden_lane  golden_source  curve_bias\n"
+                )
+                _lane_grid_log_state['init'] = True
+
+            if lane_grid:
+                centers = ','.join(f"{c:+.2f}" for c in lane_grid.get('lane_centers_norm', []))
+                road = f"{lane_grid.get('road_left', '?')}/{lane_grid.get('road_right', '?')}"
+                measured = f"{lane_grid.get('measured_left', '?')}/{lane_grid.get('measured_right', '?')}"
+                car_lane = lane_grid.get('car_lane')
+                confidence = lane_grid.get('confidence', 0.0)
+                held = int(bool(lane_grid.get('held_previous')))
+                grid_on = 1
+            else:
+                centers = '?'
+                road = '?/?'
+                measured = '?/?'
+                car_lane = '?'
+                confidence = 0.0
+                held = 0
+                grid_on = 0
+
+            golden = golden or {}
+            fh.write(
+                f"{ts}  grid={grid_on}  car_lane={car_lane}  road={road}  "
+                f"centers=[{centers}]  conf={confidence:.2f}  measured={measured}  "
+                f"held={held}  golden_active={int(bool(golden.get('active')))}  "
+                f"golden_lane={golden.get('lane') or '?'}  "
+                f"golden_source={golden.get('source') or '?'}  "
+                f"curve_bias={curve_bias:+.2f}\n"
+            )
+    except Exception:
+        pass
 
 
 def run_perception(front_frame, back_frame) -> PerceptionResult:
@@ -53,6 +116,7 @@ def run_perception(front_frame, back_frame) -> PerceptionResult:
             else token_golden
         )
         front_per['lane_grid'] = lane_grid
+        _log_lane_grid(lane_grid, front_per['golden'], curve_bias)
 
     slope = detect_slope(front_frame)
     hill = bool(slope and slope['is_hill'])

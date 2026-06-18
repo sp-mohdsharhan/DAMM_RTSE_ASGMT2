@@ -169,7 +169,6 @@ The driver opens these OpenCV windows:
 | Window | Purpose |
 | --- | --- |
 | `Front Camera` | Raw front-camera stream from the skeleton reader. |
-| `Front Camera Detection` | Annotated front-camera stream with every detected orb, nearest target ring, police marker, and current command summary. |
 | `Back Camera` | Raw rear-camera stream from the skeleton reader. |
 | `Perception` | Front/rear perception overlay, detected objects, nearest-orb marker, and command HUD. |
 | `Lane Curve` | Bird's-eye lane-curve debug panel. |
@@ -182,6 +181,12 @@ str=+0.54 acc=+0.80
 ```
 
 `events` can include `POLICE_PRIORITY`, `POLICE->GRAB_RED`, `CHASING_CAR_PRIORITY`, `HILL`, and `NEAR:<colour> d=<distance>`.
+
+Runtime lane numbering can be checked in `logs/lane_grid.log`. It records whether
+the `1..5` lane grid was found, the current `car_lane`, lane centre offsets, and
+the current Golden Lane source/lane. The `conf=` value is lowered on curves,
+edge jumps, or held edge estimates; low confidence causes Golden Lane token
+inference to ignore uncertain lane assignments and softens hard lane steering.
 
 Press `Ctrl+C` in the terminal to shut down cleanly.
 

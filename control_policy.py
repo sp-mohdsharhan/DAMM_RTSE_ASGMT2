@@ -40,6 +40,9 @@ LOW_BRIGHTNESS_THROTTLE = -1.0
 # manoeuvre commits ("hard steer").
 GOLDEN_LANE_STEER_GAIN = 1.6
 GOLDEN_LANE_HOLD_BAND = 0.06   # |lane offset| under this = already in the lane
+GOLDEN_LANE_MIN_CONFIDENCE = 0.25
+GOLDEN_LANE_MIN_GAIN_SCALE = 0.45
+GOLDEN_LANE_CURVE_SOFTEN = 0.45
 
 # Red avoidance latch: once a red is detected ahead, commit to a full
 # lane-change away from it, then counter-steer briefly to settle.
@@ -194,6 +197,7 @@ def _compute_steering(
 def steer_to_lane(
     lane_grid: dict | None,
     target_lane: int | None,
+    curve_bias: float = 0.0,
 ) -> float | None:
     """Hard-steer command (-1..+1) to drive the car onto ``target_lane`` (1..N).
 
@@ -213,10 +217,16 @@ def steer_to_lane(
     idx = int(target_lane) - 1
     if idx < 0 or idx >= len(centers):
         return None
+    confidence = float(lane_grid.get('confidence', 1.0))
+    if confidence < GOLDEN_LANE_MIN_CONFIDENCE:
+        return None
     offset = centers[idx]
     if abs(offset) < GOLDEN_LANE_HOLD_BAND:
         return 0.0
-    return float(np.clip(GOLDEN_LANE_STEER_GAIN * offset, -1.0, 1.0))
+    confidence_scale = GOLDEN_LANE_MIN_GAIN_SCALE + (1.0 - GOLDEN_LANE_MIN_GAIN_SCALE) * confidence
+    curve_scale = 1.0 - min(GOLDEN_LANE_CURVE_SOFTEN, abs(curve_bias) * GOLDEN_LANE_CURVE_SOFTEN)
+    gain = GOLDEN_LANE_STEER_GAIN * confidence_scale * curve_scale
+    return float(np.clip(gain * offset, -1.0, 1.0))
 
 
 def _police_collision_risk(front_per: FrontPerception | None) -> bool:
@@ -316,6 +326,7 @@ def compute_control(
         golden_steer = steer_to_lane(
             front_per.get('lane_grid') if front_per else None,
             golden['lane'],
+            curve_bias,
         )
         if golden_steer is not None:
             steering = golden_steer

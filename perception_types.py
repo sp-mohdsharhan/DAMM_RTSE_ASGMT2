@@ -82,11 +82,17 @@ class LaneGrid(TypedDict):
     n_lanes: int
     road_left: int
     road_right: int
+    measured_left: int
+    measured_right: int
     lane_width: float
     lane_centers: list[float]
     lane_centers_norm: list[float]
     lane_bounds: list[float]
     car_lane: Optional[int]
+    confidence: float
+    edge_confidence: float
+    curve_penalty: float
+    held_previous: bool
 
 
 class HudData(TypedDict):

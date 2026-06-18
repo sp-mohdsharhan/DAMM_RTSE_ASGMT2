@@ -100,6 +100,10 @@ ORB_ROAD_MAX_ASPECT = 2.10              # accept ovals (wider-than-tall)
 ORB_ROAD_MIN_CIRCULARITY = 0.45         # ellipses score lower than circles
 ORB_ROAD_MIN_FILL_RATIO = 0.55          # ellipse fills its bbox a bit less than a circle
 ORB_ROAD_MIN_SOLIDITY = 0.88            # convexity floor (same as strict): kills curb strips
+RED_CURB_ASPECT_MAX = 1.25              # red curb chunks are usually stretched, not orb-like
+RED_CURB_CIRCULARITY_MIN = 0.58         # reject perspective-cut red/white lane-edge pieces
+RED_CURB_EDGE_X_FRAC = 0.16             # extra strict on red near road/camera edges
+RED_CURB_EDGE_Y_FRAC = 0.45
 
 # Road-region mask thresholds (asphalt = low-saturation grey).
 # Measured asphalt: S~0-75, V~60-100. SAT_MAX 85 captures near-road (S~75) while
@@ -135,7 +139,7 @@ GREEN_ATTRACT_MIN_AREA = 0.004           # act on greens a touch earlier (commit
 # lane), hold briefly to finish the crossing, then fall back to fine-tracking.
 GREEN_LANE_CHANGE_BAND = 0.92            # |centroid_x_norm| above this => green is in another lane -> commit
 GREEN_SEEK_GAIN = 1.0                    # committed steer magnitude toward an off-lane green
-GREEN_SEEK_HOLD_S = 0.5                  # bridge frames where green flickers / leaves ROI mid-cross
+GREEN_SEEK_HOLD_S = 1.0                  # bridge frames where green flickers / leaves ROI mid-cross
 # (Keep-LEFT / keep-RIGHT home-lane bias removed — the car now centres in the
 #  lane and reacts to orbs. See plan.md Phase 5 to restore a home-lane hug.)
 RED_AVOID_GAIN = 0.7                     # full-lock swerve when red is in path
@@ -300,7 +304,8 @@ def _orb_contours_info(mask, roi_area, roi_x0=0, roi_y0=0, road_mask=None,
                        min_aspect=ORB_MIN_ASPECT, max_aspect=ORB_MAX_ASPECT,
                        min_circularity=ORB_MIN_CIRCULARITY,
                        min_fill=ORB_MIN_FILL_RATIO,
-                       min_solidity=ORB_MIN_SOLIDITY):
+                       min_solidity=ORB_MIN_SOLIDITY,
+                       reject_red_curb=False):
     """Return a LIST of orb dicts (one per qualifying contour), or [].
     Shape filters (aspect, circularity, fill, max-area) reject grass strips /
     road markings; road_mask (ROI coords) keeps only orbs whose centroid is on
@@ -334,6 +339,16 @@ def _orb_contours_info(mask, roi_area, roi_x0=0, roi_y0=0, road_mask=None,
         circularity = 4.0 * np.pi * area / (perim * perim)
         if circularity < min_circularity:
             continue                                  # not blob-like
+        full_cx_norm = ((x + w / 2.0 + roi_x0) - PROC_W / 2.0) / (PROC_W / 2.0)
+        full_cy_frac = (y + h / 2.0 + roi_y0) / float(PROC_H)
+        if reject_red_curb:
+            # Red/white lane-edge stripes can pass the road gate when their
+            # centroid falls on asphalt. They are stretched/cut by perspective
+            # and usually sit near the lower side edges, unlike round tokens.
+            if aspect > RED_CURB_ASPECT_MAX or circularity < RED_CURB_CIRCULARITY_MIN:
+                continue
+            if abs(full_cx_norm) > (1.0 - RED_CURB_EDGE_X_FRAC) and full_cy_frac > RED_CURB_EDGE_Y_FRAC:
+                continue
         bbox_area = float(w * h)
         if bbox_area <= 0 or (area / bbox_area) < min_fill:
             continue                                  # sparse/hollow (dashed stripe)
@@ -508,7 +523,11 @@ def detect_front_objects_hsv(frame):
 
     def _orbs(color):
         lst = _orb_contours_info(_color_mask(hsv, *_hsv_active[color]),
-                                 roi_area, roi_x0, roi_y0, **gate)
+                                 roi_area,
+                                 roi_x0,
+                                 roi_y0,
+                                 reject_red_curb=(color == 'red'),
+                                 **gate)
         for o in lst:
             o['color'] = color
         return lst
@@ -848,12 +867,15 @@ BASE_MIN_SEPARATION = 40      # px between left/right base picks
 
 # CL5 -- lane-grid labelling (Phase 17 / Golden Lane).
 # The track has N_LANES road lanes, numbered 1..N left-to-right from the
-# driver's view. We slice the bird's-eye road span into equal lanes so the
-# controller can hard-steer to a specific lane (e.g. the inferred golden lane).
+# driver's view. We detect the road span in bird's-eye space, then smooth it so
+# lane numbering can follow the car without jumping on sparse lane markings.
 N_LANES = 5
 LANE_COL_MIN_PIX = 8          # min column-sum (bottom band) to count as road signal
 LANE_EDGE_BAND_FRAC = 0.5     # use bottom half of the mask to find road edges
 LANE_MIN_ROAD_FRAC = 0.30     # road span must cover >= this frac of warp width
+LANE_GRID_EMA_ALPHA = 0.25
+LANE_GRID_MAX_EDGE_JUMP_FRAC = 0.20
+_lane_grid_state = {'left': None, 'right': None}
 
 # Golden Lane camera fallback. Since the "LANE N - ALL GREEN" banner is drawn on
 # the main game view, not the camera feed, infer the event from a lane that has a
@@ -864,6 +886,8 @@ GOLDEN_INFER_DOMINANCE_RATIO = 1.45
 GOLDEN_INFER_GREEN_WEIGHT = 1.0
 GOLDEN_INFER_NON_GREEN_PENALTY = 0.45
 GOLDEN_INFER_MAX_DISTANCE = 220.0
+GOLDEN_INFER_MIN_LANE_CONFIDENCE = 0.45
+GOLDEN_INFER_BOUNDARY_MARGIN_FRAC = 0.15
 
 # Cached perspective matrices (computed once).
 _IPM_M = None
@@ -1005,11 +1029,10 @@ def _curve_bias_from_pixels(lx, ly, rx, ry):
 def estimate_lane_grid(mask):
     """CL5: label the road's N_LANES lanes (1..N, left->right) in warp space.
 
-    Finds the road's left/right extent from the lane-pixel mask (bottom band),
-    slices it into N_LANES equal lanes, and locates which lane the car sits in
-    (the car is assumed centred at the warp's bottom-centre). This gives the
-    controller concrete lane targets so it can hard-steer onto a chosen lane
-    (e.g. the inferred Golden Lane).
+    Finds the road's left/right extent from the lane-pixel mask, smooths it
+    across frames, slices that span into 5 lanes, and locates which lane contains
+    the car at the warp bottom-centre. This is used for Golden Lane targeting
+    and for validating which lane the car is currently in.
 
     Returns dict (all x-values in warp pixels; *_norm in -1..+1 about warp
     centre, positive => right of car) or None if there is not enough signal:
@@ -1026,15 +1049,41 @@ def estimate_lane_grid(mask):
         return None
     h, w = mask.shape
     y0 = int(h * (1.0 - LANE_EDGE_BAND_FRAC))
-    hist = mask[y0:, :].sum(axis=0) // 255  # per-column pixel count
+    hist = mask[y0:, :].sum(axis=0) // 255
     cols = np.nonzero(hist >= LANE_COL_MIN_PIX)[0]
     if cols.size == 0:
         return None
 
-    road_left = int(cols.min())
-    road_right = int(cols.max())
+    measured_left = float(cols.min())
+    measured_right = float(cols.max())
+    measured_span = measured_right - measured_left
+    if measured_span < float(w * LANE_MIN_ROAD_FRAC):
+        return None
+
+    prev_left = _lane_grid_state['left']
+    prev_right = _lane_grid_state['right']
+    max_jump = w * LANE_GRID_MAX_EDGE_JUMP_FRAC
+    jump_ratio = 0.0
+    held_previous = False
+    if prev_left is None or prev_right is None:
+        road_left = measured_left
+        road_right = measured_right
+    else:
+        left_jump = abs(measured_left - prev_left)
+        right_jump = abs(measured_right - prev_right)
+        jump_ratio = max(left_jump, right_jump) / max(1.0, w)
+        if left_jump > max_jump or right_jump > max_jump:
+            road_left = prev_left
+            road_right = prev_right
+            held_previous = True
+        else:
+            road_left = (1.0 - LANE_GRID_EMA_ALPHA) * prev_left + LANE_GRID_EMA_ALPHA * measured_left
+            road_right = (1.0 - LANE_GRID_EMA_ALPHA) * prev_right + LANE_GRID_EMA_ALPHA * measured_right
+
+    _lane_grid_state['left'] = road_left
+    _lane_grid_state['right'] = road_right
     span = road_right - road_left
-    if span < int(w * LANE_MIN_ROAD_FRAC):
+    if span < float(w * LANE_MIN_ROAD_FRAC):
         return None
 
     lane_width = span / float(N_LANES)
@@ -1052,15 +1101,27 @@ def estimate_lane_grid(mask):
         car_lane = int((car_x - road_left) / lane_width) + 1
         car_lane = max(1, min(N_LANES, car_lane))
 
+    lane_confidence = 1.0
+    lane_confidence -= min(0.45, jump_ratio * 1.8)
+    if held_previous:
+        lane_confidence -= 0.25
+    lane_confidence = float(np.clip(lane_confidence, 0.0, 1.0))
+
     return {
         'n_lanes': N_LANES,
-        'road_left': road_left,
-        'road_right': road_right,
+        'road_left': int(round(road_left)),
+        'road_right': int(round(road_right)),
+        'measured_left': int(round(measured_left)),
+        'measured_right': int(round(measured_right)),
         'lane_width': float(lane_width),
         'lane_centers': [float(c) for c in lane_centers],
         'lane_centers_norm': lane_centers_norm,
         'lane_bounds': [float(b) for b in lane_bounds],
         'car_lane': car_lane,
+        'confidence': lane_confidence,
+        'edge_confidence': lane_confidence,
+        'curve_penalty': 0.0,
+        'held_previous': bool(held_previous),
     }
 
 
@@ -1086,6 +1147,10 @@ def _lane_for_warp_x(lane_grid, warp_x):
         return None
     for idx in range(len(bounds) - 1):
         if bounds[idx] <= warp_x <= bounds[idx + 1]:
+            width = max(1.0, bounds[idx + 1] - bounds[idx])
+            margin = width * GOLDEN_INFER_BOUNDARY_MARGIN_FRAC
+            if (warp_x - bounds[idx]) < margin or (bounds[idx + 1] - warp_x) < margin:
+                return None
             return idx + 1
     return None
 
@@ -1106,6 +1171,8 @@ def infer_golden_lane_from_tokens(front_per, lane_grid):
         'confidence': 0.0,
     }
     if not front_per or not lane_grid:
+        return inactive
+    if lane_grid.get('confidence', 1.0) < GOLDEN_INFER_MIN_LANE_CONFIDENCE:
         return inactive
 
     lane_count = int(lane_grid.get('n_lanes') or N_LANES)
@@ -1184,6 +1251,15 @@ def detect_lane_curve(frame):
     rx, ry, rrects = _sliding_window_collect(mask, right_base)
     curve_bias, lane_center_norm = _curve_bias_from_pixels(lx, ly, rx, ry)
     lane_grid = estimate_lane_grid(mask)
+    if lane_grid is not None:
+        curve_penalty = min(0.45, abs(curve_bias) * 0.45)
+        lane_grid['edge_confidence'] = float(lane_grid.get('confidence', 1.0))
+        lane_grid['curve_penalty'] = float(curve_penalty)
+        lane_grid['confidence'] = float(np.clip(
+            lane_grid.get('confidence', 1.0) - curve_penalty,
+            0.0,
+            1.0,
+        ))
     return {
         'warp': warp,
         'mask': mask,
@@ -1283,26 +1359,25 @@ def detect_low_brightness(frame):
 # ---------------------------------------------------------------------------
 # Golden Lane banner detection (Phase 17)
 # ---------------------------------------------------------------------------
-# When a Golden Lane event is active the game shows an orange banner near the
-# top-centre of the form "LANE N - ALL GREEN! (Xs)", where N is the golden lane
-# (1..N_LANES, left-to-right) and X is a seconds countdown. We detect the orange
-# text to know the event is live, and best-effort read the lane digit N and the
-# countdown X. The lane digit is the source of truth; when OCR is not confident
-# 'lane' is None so the caller can fall back to green-token inference.
-HSV_GOLDEN_BANNER = (np.array([8, 110, 130]), np.array([26, 255, 255]))
-GOLDEN_BANNER_Y0_FRAC = 0.05      # banner sits just below the white game timer
-GOLDEN_BANNER_Y1_FRAC = 0.20
-GOLDEN_BANNER_X0_FRAC = 0.18      # avoid the side score / speed widgets
-GOLDEN_BANNER_X1_FRAC = 0.82
-GOLDEN_BANNER_MIN_PIX = 55        # orange pixels (PROC res) needed to call active
-GOLDEN_DIGIT_MIN_SCORE = 0.42     # min template-match score to trust a digit
-GOLDEN_DIGIT_MARGIN = 0.05        # best match must beat 2nd-best by this
+# When a Golden Lane event is active the patched game shows a thin orange/yellow
+# strip at the very top of the front-camera feed with dark text:
+# "LANE N - ALL GREEN! (Xs)".
+HSV_GOLDEN_BANNER = (np.array([8, 80, 120]), np.array([35, 255, 255]))
+GOLDEN_BANNER_Y0_FRAC = 0.00      # patched banner touches the top edge
+GOLDEN_BANNER_Y1_FRAC = 0.08
+GOLDEN_BANNER_X0_FRAC = 0.00
+GOLDEN_BANNER_X1_FRAC = 1.00
+GOLDEN_BANNER_MIN_PIX = 120       # orange/yellow strip pixels needed to call active
+GOLDEN_TEXT_MIN_PIX = 8           # dark text pixels needed before digit OCR
+GOLDEN_DIGIT_MIN_SCORE = 0.52     # pixel-font bitmap match score
+GOLDEN_DIGIT_MARGIN = 0.03        # best match must beat 2nd-best by this
 GOLDEN_BANNER_UPSCALE = 4         # enlarge the banner mask before OCR
 # Expected horizontal positions of the lane digit and the countdown digit, as a
-# fraction of the orange text's bounding-box width. The message format is fixed
+# fraction of the dark text's bounding-box width. The message format is fixed
 # ("LANE N - ALL GREEN! (Xs)") so these positions are stable.
-GOLDEN_LANE_DIGIT_XFRAC = 0.22
-GOLDEN_COUNT_DIGIT_XFRAC = 0.90
+GOLDEN_LANE_DIGIT_XFRAC = 0.27
+GOLDEN_COUNT_DIGIT_XFRAC = 0.89
+GOLDEN_DIGIT_TEMPLATE_SIZE = (5, 7)
 
 # Golden Lane detection log. Appends a line whenever the banner state changes
 # (active<->inactive) or the read lane/countdown changes, so a run can be
@@ -1413,17 +1488,107 @@ def _golden_debug_sample(active, lane, remaining_s, banner_pix, roi, mask):
 
 
 def _get_golden_digit_templates():
-    """Binary glyph templates for digits 1..N_LANES, generated once and cached."""
+    """Binary 5x7 pixel-font templates for Golden Lane digits."""
     global _golden_digit_templates
     if _golden_digit_templates is None:
+        patterns = {
+            0: [
+                "01110",
+                "10001",
+                "10011",
+                "10101",
+                "11001",
+                "10001",
+                "01110",
+            ],
+            1: [
+                "00100",
+                "01100",
+                "00100",
+                "00100",
+                "00100",
+                "00100",
+                "01110",
+            ],
+            2: [
+                "01110",
+                "10001",
+                "00001",
+                "00010",
+                "00100",
+                "01000",
+                "11111",
+            ],
+            3: [
+                "11110",
+                "00001",
+                "00001",
+                "01110",
+                "00001",
+                "00001",
+                "11110",
+            ],
+            4: [
+                "00010",
+                "00110",
+                "01010",
+                "10010",
+                "11111",
+                "00010",
+                "00010",
+            ],
+            5: [
+                "11111",
+                "10000",
+                "10000",
+                "11110",
+                "00001",
+                "00001",
+                "11110",
+            ],
+            6: [
+                "01110",
+                "10000",
+                "10000",
+                "11110",
+                "10001",
+                "10001",
+                "01110",
+            ],
+            7: [
+                "11111",
+                "00001",
+                "00010",
+                "00100",
+                "01000",
+                "01000",
+                "01000",
+            ],
+            8: [
+                "01110",
+                "10001",
+                "10001",
+                "01110",
+                "10001",
+                "10001",
+                "01110",
+            ],
+            9: [
+                "01110",
+                "10001",
+                "10001",
+                "01111",
+                "00001",
+                "00001",
+                "01110",
+            ],
+        }
         templates = {}
-        for d in range(1, N_LANES + 1):
-            canvas = np.zeros((40, 30), np.uint8)
-            cv2.putText(canvas, str(d), (4, 33), cv2.FONT_HERSHEY_SIMPLEX,
-                        1.1, 255, 2, cv2.LINE_8)
-            ys, xs = np.nonzero(canvas)
-            glyph = canvas[ys.min():ys.max() + 1, xs.min():xs.max() + 1] if xs.size else canvas
-            templates[d] = cv2.resize(glyph, (20, 28), interpolation=cv2.INTER_AREA)
+        for d, rows in patterns.items():
+            templates[d] = np.array(
+                [[255 if ch == "1" else 0 for ch in row] for row in rows],
+                dtype=np.uint8,
+            )
         _golden_digit_templates = templates
     return _golden_digit_templates
 
@@ -1431,18 +1596,20 @@ def _get_golden_digit_templates():
 def _match_golden_digit(glyph_bin):
     """Return (best_digit, score, margin) for a binary glyph crop.
 
-    Uses normalized correlation between the candidate and each digit template
-    (both reduced to a fixed 20x28 binary). margin is best_score - 2nd_score."""
+    Uses IoU between the candidate and 5x7 pixel-font digit templates. margin is
+    best_score - 2nd_score.
+    """
     if glyph_bin is None or glyph_bin.size == 0:
         return None, 0.0, 0.0
-    cand = cv2.resize(glyph_bin, (20, 28), interpolation=cv2.INTER_AREA)
+    cand = cv2.resize(glyph_bin, GOLDEN_DIGIT_TEMPLATE_SIZE, interpolation=cv2.INTER_AREA)
     cand = (cand > 0).astype(np.float32)
-    cand_norm = float(np.sqrt((cand * cand).sum())) + 1e-6
+    cand_sum = float(cand.sum())
     scores = []
     for d, tmpl in _get_golden_digit_templates().items():
         t = (tmpl > 0).astype(np.float32)
-        t_norm = float(np.sqrt((t * t).sum())) + 1e-6
-        scores.append((float((cand * t).sum()) / (cand_norm * t_norm), d))
+        intersection = float((cand * t).sum())
+        union = cand_sum + float(t.sum()) - intersection + 1e-6
+        scores.append((intersection / union, d))
     scores.sort(reverse=True)
     best_score, best_d = scores[0]
     margin = best_score - scores[1][0] if len(scores) > 1 else best_score
@@ -1457,7 +1624,7 @@ def _golden_glyph_near(mask, x_target):
     best, best_dx = None, 1e9
     for c in contours:
         x, y, w, hh = cv2.boundingRect(c)
-        if hh < h * 0.25:
+        if hh < max(3, h * 0.06):
             continue
         dx = abs((x + w / 2.0) - x_target)
         if dx < best_dx:
@@ -1468,26 +1635,41 @@ def _golden_glyph_near(mask, x_target):
     return mask[y:y + hh, x:x + w]
 
 
-def _read_golden_digit(mask, x_target):
-    """Confident digit (int 1..N_LANES) at x_target in the banner mask, or None."""
+def _read_golden_digit(mask, x_target, allowed=None):
+    """Confident digit at x_target in the banner mask, or None."""
     glyph = _golden_glyph_near(mask, x_target)
     if glyph is None:
         return None
     d, score, margin = _match_golden_digit(glyph)
-    if d is not None and score >= GOLDEN_DIGIT_MIN_SCORE and margin >= GOLDEN_DIGIT_MARGIN:
+    if (
+        d is not None
+        and (allowed is None or d in allowed)
+        and score >= GOLDEN_DIGIT_MIN_SCORE
+        and margin >= GOLDEN_DIGIT_MARGIN
+    ):
         return int(d)
     return None
+
+
+def _golden_text_mask(roi, banner_mask):
+    """Dark text pixels inside the top orange/yellow Golden Lane strip."""
+    gray = cv2.cvtColor(roi, cv2.COLOR_BGR2GRAY)
+    text = cv2.inRange(gray, 0, 95)
+    if banner_mask is not None:
+        text = cv2.bitwise_and(text, cv2.dilate(banner_mask, np.ones((3, 3), np.uint8)))
+    text = cv2.morphologyEx(text, cv2.MORPH_OPEN, np.ones((2, 2), np.uint8))
+    return text
 
 
 def detect_golden_lane(frame):
     """Detect the Golden Lane banner and read its lane number + countdown.
 
     Returns dict:
-        'active'      : True when the orange "LANE N - ALL GREEN!" banner shows
+        'active'      : True when the orange "LANE N - ALL GREEN!" banner strip shows
         'lane'        : golden lane number (1..N_LANES) when read confidently, else None
         'remaining_s' : countdown seconds read from "(Xs)" when confident, else None
 
-    Detection is robust (orange text in the top-centre banner ROI); the lane /
+    The patched game draws dark text on an orange/yellow top strip. The lane /
     countdown digits are best-effort OCR. When 'active' is True but 'lane' is
     None the caller should fall back to green-token lane inference.
     """
@@ -1512,17 +1694,25 @@ def detect_golden_lane(frame):
         _golden_log(False, None, None, banner_pix)
         return inactive
 
-    # Banner is active. Enlarge the mask and read the digits at their expected
-    # fractional positions within the orange text's bounding box.
-    up = cv2.resize(mask, None, fx=GOLDEN_BANNER_UPSCALE, fy=GOLDEN_BANNER_UPSCALE,
+    # Banner is active. Read the dark text printed on the orange/yellow strip.
+    text_mask = _golden_text_mask(roi, mask)
+    if cv2.countNonZero(text_mask) < GOLDEN_TEXT_MIN_PIX:
+        _golden_debug_sample(True, None, None, banner_pix, roi, text_mask)
+        _golden_log(True, None, None, banner_pix)
+        return {'active': True, 'lane': None, 'remaining_s': None}
+
+    up = cv2.resize(text_mask, None, fx=GOLDEN_BANNER_UPSCALE, fy=GOLDEN_BANNER_UPSCALE,
                     interpolation=cv2.INTER_NEAREST)
-    up = cv2.morphologyEx(up, cv2.MORPH_CLOSE, np.ones((3, 3), np.uint8))
     ys, xs = np.nonzero(up)
     lane, remaining_s = None, None
     if xs.size:
         tx0, tx1 = int(xs.min()), int(xs.max())
         tw = max(1, tx1 - tx0)
-        lane = _read_golden_digit(up, tx0 + GOLDEN_LANE_DIGIT_XFRAC * tw)
+        lane = _read_golden_digit(
+            up,
+            tx0 + GOLDEN_LANE_DIGIT_XFRAC * tw,
+            allowed=set(range(1, N_LANES + 1)),
+        )
         countdown = _read_golden_digit(up, tx0 + GOLDEN_COUNT_DIGIT_XFRAC * tw)
         if countdown is not None:
             remaining_s = float(countdown)

@@ -3,3 +3,4 @@ video/Recording 2026-06-10 092725.mp4
 video/Recording 2026-06-10 100734.mp4
 __pycache__/
 *.py[cod]
+logs/

@@ -257,14 +257,35 @@ def compute_control(
     """Return (steering, accel, events_visible) for the current perception frame."""
     global _lane_change_until, _lane_change_dir
 
-    if rear_per is not None and rear_per['other_car']['growing'] and now >= _lane_change_until:
+    rear_other = rear_per.get('other_car') if rear_per else None
+    chasing_seen = bool(rear_other and rear_other.get('info'))
+
+    if chasing_seen and now >= _lane_change_until:
         _lane_change_until = now + LANE_CHANGE_DURATION_S
         _lane_change_dir = -_lane_change_dir
 
     force_lc = now < _lane_change_until
     police_seen = bool(front_per and front_per.get('police'))
+    golden = front_per.get('golden') if front_per else None
 
-    if low_light:
+    if police_seen:
+        # Front police collision is game-ending: dodge first when close/centred,
+        # otherwise seek a red token immediately to pass EV2.
+        steering = _compute_steering(
+            front_per,
+            curve_bias,
+            hill,
+            now,
+            False,
+            _lane_change_dir,
+        )
+        accel = CRUISE_THROTTLE
+    elif force_lc:
+        # Rear chasing car is collision-critical: once detected, commit to the
+        # evasive lane change regardless of front-token or Golden Lane goals.
+        steering = float(LANE_CHANGE_STEER * _lane_change_dir)
+        accel = CRUISE_THROTTLE
+    elif low_light:
         steering = 0.0
         accel = LOW_BRIGHTNESS_THROTTLE
     else:
@@ -278,16 +299,20 @@ def compute_control(
         )
         accel = CRUISE_THROTTLE
 
-    if tactical and tactical.get('police_active') and not _police_collision_risk(front_per):
+    if (
+        not police_seen
+        and not force_lc
+        and tactical
+        and tactical.get('police_active')
+        and not _police_collision_risk(front_per)
+    ):
         red_seek = _steer_to_nearest_red(front_per, curve_bias)
         if red_seek is not None:
             steering = red_seek
 
-    # Golden Lane has top steering priority: snap to the announced lane and hold
-    # it for the 5 s window. Overrides normal steering (and steers through a
-    # darkness brake) whenever the lane is known and the grid is available.
-    golden = front_per.get('golden') if front_per else None
-    if golden and golden.get('active') and golden.get('lane'):
+    # Golden Lane overrides normal front-camera steering, but not the rear
+    # chasing-car escape above.
+    if not police_seen and not force_lc and golden and golden.get('active') and golden.get('lane'):
         golden_steer = steer_to_lane(
             front_per.get('lane_grid') if front_per else None,
             golden['lane'],
@@ -298,7 +323,11 @@ def compute_control(
     events_visible = []
     if golden and golden.get('active'):
         if golden.get('lane'):
-            events_visible.append(f"GOLDEN->L{golden['lane']}")
+            source = golden.get('source')
+            if source == 'tokens':
+                events_visible.append(f"GOLDEN(tok)->L{golden['lane']}")
+            else:
+                events_visible.append(f"GOLDEN->L{golden['lane']}")
         else:
             events_visible.append('GOLDEN(?)')
     if tactical:
@@ -313,9 +342,12 @@ def compute_control(
         elif tactical.get('police_timeout'):
             events_visible.append('POLICE_TIMEOUT')
     if police_seen:
+        events_visible.insert(0, 'POLICE_PRIORITY')
         events_visible.append('POLICE->GRAB_RED')
-    if force_lc:
-        events_visible.append('CHASING_CAR')
+    if force_lc and not police_seen:
+        events_visible.insert(0, 'CHASING_CAR_PRIORITY')
+    elif force_lc:
+        events_visible.append('CHASING_CAR_PRIORITY')
     if hill:
         events_visible.append('HILL')
     near = front_per.get('nearest') if front_per else None

@@ -34,12 +34,16 @@ class FrontPerception(TypedDict, total=False):
     lane_grid: Optional['LaneGrid']
 
 
-class GoldenLane(TypedDict):
+class GoldenLane(TypedDict, total=False):
     """Golden Lane banner readout from detect_golden_lane()."""
 
     active: bool
     lane: Optional[int]
     remaining_s: Optional[float]
+    source: str
+    confidence: float
+    lane_scores: list[float]
+    green_counts: list[int]
 
 
 class RearObjectState(TypedDict):

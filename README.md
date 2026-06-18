@@ -52,7 +52,7 @@ The controller uses a rule-based real-time perception and steering stack. It is 
 | Lane offset | Canny + HoughLinesP on the lower front ROI estimates lane-centre offset for overlay/debug. The current steering policy does not use this as the default fallback. |
 | Lane curve | Bird's-eye warp, Sobel/V-channel lane-pixel mask, histogram bases, and sliding-window pixel collection estimate a `curve_bias` used as a small anticipatory steering bias while seeking green tokens. |
 | Lane grid (1-5) | From the same bird's-eye lane-pixel mask, the road span is sliced into `N_LANES = 5` equal lanes numbered left-to-right. `estimate_lane_grid()` returns each lane's centre offset plus the car's current lane, giving the controller concrete lane targets for hard steering. |
-| Golden Lane banner | `detect_golden_lane()` thresholds the orange `LANE N - ALL GREEN! (Xs)` banner in a top-centre ROI (HSV range) to detect the event, then best-effort reads the lane digit (1-5) and countdown via digit templates. Detections are logged to `logs/golden_lane.log`. |
+| Golden Lane inference | The `LANE N - ALL GREEN! (Xs)` banner is drawn on the main SpeedTrials2D window, not the front-camera socket frame. The current camera-only fallback uses `infer_golden_lane_from_tokens()` to project detected tokens into the lane grid and choose the lane with the strongest green-token concentration. Banner ROI debug logs remain available in `logs/`, but they are not the practical trigger from camera input. |
 | Hill/slope detection | Tracks the asphalt horizon using an EMA baseline. When the horizon deviates enough, the controller treats the road as a hill and triggers red/yellow evasion earlier. |
 | Low brightness | Mean V channel on a centre crop detects the low-light challenge. |
 
@@ -60,10 +60,10 @@ The controller uses a rule-based real-time perception and steering stack. It is 
 
 The steering decision is ordered from highest priority to lowest:
 
-1. **Low brightness recovery** - if the front frame is dim, steering is set to `0.0` and acceleration is set to `-1.0` to reverse/recover visibility.
-2. **Golden Lane** - when the Golden Lane banner is active and its lane number is read, hard-steer onto that lane (via `steer_to_lane()` and the lane grid) and hold until the window ends. This overrides the lower-priority steering below.
-3. **Front police car** - if the police car is close and centred, dodge away from it. Otherwise, seek a red token, preferring one on the opposite side of the police car. If no red token is visible, ease away from the police side.
-4. **Rear chasing car** - if the rear teal car is growing in area, commit to a forced lane change for `1.5 s`. The lane-change direction alternates on each trigger.
+1. **Front police car** - if police is detected, immediately take over steering. If it is close and centred, dodge away from it; otherwise seek a red token, preferring one on the opposite side of the police car. The HUD shows `POLICE_PRIORITY`.
+2. **Rear chasing car** - if the rear teal car is detected, immediately commit to a forced lane change for `1.5 s` regardless of front-camera goals. The HUD shows `CHASING_CAR_PRIORITY`.
+3. **Low brightness recovery** - if the front frame is dim, steering is set to `0.0` and acceleration is set to `-1.0` to reverse/recover visibility.
+4. **Golden Lane** - when token clustering infers a Golden Lane, hard-steer onto that lane via `steer_to_lane()` and the lane grid. The HUD shows `GOLDEN(tok)->L#` for this camera-based path. This overrides the lower-priority steering below.
 5. **Nearest imminent orb** - if any orb is within the IPM action distance (`ORB_ACT_DISTANCE = 120`), the nearest orb drives the action. If a red/yellow hazard is almost as near as a green (`ORB_TIE_MARGIN = 25`), hazard avoidance wins.
 6. **Green token seek** - steer toward green. If the green is clearly in another lane, commit to a stronger lane change and hold briefly so flicker does not cancel the manoeuvre.
 7. **Red token avoidance** - when a red token is ahead, commit to a full lane-change away from it for `1.6 s`, then counter-steer briefly for `0.35 s` to settle.
@@ -88,9 +88,9 @@ Hill policy does not reduce throttle. It scales red/yellow trigger thresholds by
 | Green token | Green on-road orb in front camera | Seek/grab using proportional steering or committed lane change. |
 | Red token | Red on-road orb in front camera | Avoid with committed lane change, except during police handling where red is sought to escape. |
 | Yellow token | Yellow on-road orb in front camera | Avoid only when close and centred. |
-| Chasing car | Teal car in rear camera with growing area | Forced lane change, alternating direction per trigger. |
-| Police car | Red/blue police livery in front camera | Dodge if collision risk is high; otherwise seek a red token. |
-| Golden Lane | Orange `LANE N - ALL GREEN! (Xs)` banner in front camera | Read the lane number, hard-steer onto that lane via the lane grid, and hold until the window ends. |
+| Chasing car | Teal car in rear camera | Highest-priority forced lane change, alternating direction per trigger. |
+| Police car | Red/blue police livery in front camera | Highest-priority steering: dodge if collision risk is high; otherwise seek a red token. |
+| Golden Lane | Green-token concentration in one lane from the front camera; text banner exists only on the main game window | Infer the lane, hard-steer onto that lane via the lane grid, and hold while the evidence remains active. |
 | Low brightness | Low mean V channel in front centre crop | Reverse with straight steering to recover. |
 | Hill/crest | Asphalt horizon deviates from flat-road EMA baseline | Trigger red/yellow avoidance earlier. |
 
@@ -169,6 +169,7 @@ The driver opens these OpenCV windows:
 | Window | Purpose |
 | --- | --- |
 | `Front Camera` | Raw front-camera stream from the skeleton reader. |
+| `Front Camera Detection` | Annotated front-camera stream with every detected orb, nearest target ring, police marker, and current command summary. |
 | `Back Camera` | Raw rear-camera stream from the skeleton reader. |
 | `Perception` | Front/rear perception overlay, detected objects, nearest-orb marker, and command HUD. |
 | `Lane Curve` | Bird's-eye lane-curve debug panel. |
@@ -180,7 +181,7 @@ target=80 eff=80 police=0 events=['NEAR:G d=92']
 str=+0.54 acc=+0.80
 ```
 
-`events` can include `POLICE->GRAB_RED`, `CHASING_CAR`, `HILL`, and `NEAR:<colour> d=<distance>`.
+`events` can include `POLICE_PRIORITY`, `POLICE->GRAB_RED`, `CHASING_CAR_PRIORITY`, `HILL`, and `NEAR:<colour> d=<distance>`.
 
 Press `Ctrl+C` in the terminal to shut down cleanly.
 
@@ -240,3 +241,7 @@ Our implementation lives in the editable regions and supporting modules:
 - **Front-camera police handling** - the current V2.0 police challenge is handled as a front obstacle, not a rear event.
 - **Low-light reverse recovery** - dim frames cause a straight reverse command instead of merely slowing down.
 - **Split locks and non-blocking control send** - reduces priority-inversion risk and keeps actuator output periodic.
+
+### Known Limitations
+
+- **Golden Lane camera inference can be blocked by yellow-token debuffs.** If the car hits a yellow token before or during Golden Lane, the game can apply a negative camera effect where tokens disappear or temporarily appear white/unknown. During that window, the front camera may not contain enough green-token evidence for `infer_golden_lane_from_tokens()` to identify the golden lane, so the hard-steer trigger can be delayed or missed.

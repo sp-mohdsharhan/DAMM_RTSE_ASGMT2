@@ -15,6 +15,7 @@ from image_detection import (
     detect_low_brightness,
     detect_rear,
     detect_slope,
+    infer_golden_lane_from_tokens,
 )
 from perception_types import PerceptionResult
 
@@ -39,11 +40,19 @@ def run_perception(front_frame, back_frame) -> PerceptionResult:
     curve_dbg = detect_lane_curve(front_frame)
     curve_bias = curve_dbg['curve_bias'] if curve_dbg else 0.0
 
-    # Phase 17: Golden Lane banner + the lane grid it steers onto. Attaching both
-    # to front_per keeps the perception tuple arity unchanged.
+    # Phase 17: Golden Lane. The banner is drawn on the main game view, not the
+    # camera feed, so the camera fallback infers the lane from green-token
+    # concentration when text detection is inactive or cannot read the lane.
     if front_per is not None:
-        front_per['golden'] = detect_golden_lane(front_frame)
-        front_per['lane_grid'] = curve_dbg.get('lane_grid') if curve_dbg else None
+        lane_grid = curve_dbg.get('lane_grid') if curve_dbg else None
+        banner_golden = detect_golden_lane(front_frame)
+        token_golden = infer_golden_lane_from_tokens(front_per, lane_grid)
+        front_per['golden'] = (
+            banner_golden
+            if banner_golden.get('active') and banner_golden.get('lane')
+            else token_golden
+        )
+        front_per['lane_grid'] = lane_grid
 
     slope = detect_slope(front_frame)
     hill = bool(slope and slope['is_hill'])

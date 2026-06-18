@@ -29,6 +29,9 @@ PUBLIC SURFACE (everything below is consumed by sample_drive.py):
     detect_golden_lane(frame)   -> dict          (Phase 17: orange 'LANE N - ALL GREEN! (Xs)'
                                                   banner -> {'active','lane','remaining_s'};
                                                   logs to logs/golden_lane.log)
+    infer_golden_lane_from_tokens(front_per, lane_grid) -> dict
+                                                (camera-only fallback: infer the golden lane from
+                                                 green-token concentration per lane)
     draw_lane_curve_debug(dbg)  -> ndarray | None (composite warp/mask/windows panel)
     detect_low_brightness(frame) -> bool        (V2.0 Challenge 1: low-light recovery)
     detect_slope(frame)         -> dict | None  (hill / pitch estimate; 'is_hill' drives
@@ -852,6 +855,16 @@ LANE_COL_MIN_PIX = 8          # min column-sum (bottom band) to count as road si
 LANE_EDGE_BAND_FRAC = 0.5     # use bottom half of the mask to find road edges
 LANE_MIN_ROAD_FRAC = 0.30     # road span must cover >= this frac of warp width
 
+# Golden Lane camera fallback. Since the "LANE N - ALL GREEN" banner is drawn on
+# the main game view, not the camera feed, infer the event from a lane that has a
+# strong concentration of green tokens.
+GOLDEN_INFER_MIN_GREEN_COUNT = 3
+GOLDEN_INFER_MIN_SCORE = 2.6
+GOLDEN_INFER_DOMINANCE_RATIO = 1.45
+GOLDEN_INFER_GREEN_WEIGHT = 1.0
+GOLDEN_INFER_NON_GREEN_PENALTY = 0.45
+GOLDEN_INFER_MAX_DISTANCE = 220.0
+
 # Cached perspective matrices (computed once).
 _IPM_M = None
 _IPM_MINV = None
@@ -1051,6 +1064,94 @@ def estimate_lane_grid(mask):
     }
 
 
+def _orb_ground_warp_x(orb):
+    """Project an orb's bottom-centre contact point into bird's-eye x."""
+    bbox = orb.get('bbox')
+    if not bbox:
+        return None
+    x, y, w, h = bbox
+    px = float(x + w / 2.0)
+    py = float(y + h)
+    M, _ = _get_ipm_matrices()
+    pt = np.array([[[px, py]]], dtype=np.float32)
+    wx, wy = cv2.perspectiveTransform(pt, M)[0, 0]
+    if wx < 0.0 or wx > IPM_DST_W or wy < 0.0 or wy > IPM_DST_H:
+        return None
+    return float(wx)
+
+
+def _lane_for_warp_x(lane_grid, warp_x):
+    bounds = lane_grid.get('lane_bounds') if lane_grid else None
+    if not bounds or warp_x is None:
+        return None
+    for idx in range(len(bounds) - 1):
+        if bounds[idx] <= warp_x <= bounds[idx + 1]:
+            return idx + 1
+    return None
+
+
+def infer_golden_lane_from_tokens(front_per, lane_grid):
+    """Infer Golden Lane from green-token concentration in one road lane.
+
+    The Golden Lane text is not present in the camera feed, so this is the
+    camera-only trigger for the existing hard-steer path. It returns the same
+    shape as detect_golden_lane(): active/lane/remaining_s. Extra score fields
+    are included for logging/debugging but ignored by the controller.
+    """
+    inactive = {
+        'active': False,
+        'lane': None,
+        'remaining_s': None,
+        'source': 'tokens',
+        'confidence': 0.0,
+    }
+    if not front_per or not lane_grid:
+        return inactive
+
+    lane_count = int(lane_grid.get('n_lanes') or N_LANES)
+    lane_green_counts = [0] * lane_count
+    lane_scores = [0.0] * lane_count
+
+    for orb in front_per.get('orbs', []):
+        if orb.get('distance', float('inf')) > GOLDEN_INFER_MAX_DISTANCE:
+            continue
+        lane = _lane_for_warp_x(lane_grid, _orb_ground_warp_x(orb))
+        if lane is None:
+            continue
+
+        idx = lane - 1
+        # Farther tokens are still useful, but closer tokens are more likely to
+        # match the lane the car can actually reach before the 5 s timer ends.
+        distance = max(0.0, float(orb.get('distance', GOLDEN_INFER_MAX_DISTANCE)))
+        proximity = 1.0 + max(0.0, GOLDEN_INFER_MAX_DISTANCE - distance) / GOLDEN_INFER_MAX_DISTANCE
+        if orb.get('color') == 'green':
+            lane_green_counts[idx] += 1
+            lane_scores[idx] += GOLDEN_INFER_GREEN_WEIGHT * proximity
+        else:
+            lane_scores[idx] -= GOLDEN_INFER_NON_GREEN_PENALTY
+
+    best_idx = int(np.argmax(lane_scores)) if lane_scores else 0
+    best_score = lane_scores[best_idx] if lane_scores else 0.0
+    best_green_count = lane_green_counts[best_idx] if lane_green_counts else 0
+    other_scores = [s for i, s in enumerate(lane_scores) if i != best_idx]
+    next_score = max(other_scores) if other_scores else 0.0
+    dominance_ok = best_score >= max(GOLDEN_INFER_MIN_SCORE, next_score * GOLDEN_INFER_DOMINANCE_RATIO)
+
+    if best_green_count < GOLDEN_INFER_MIN_GREEN_COUNT or not dominance_ok:
+        return inactive
+
+    confidence = float(np.clip(best_score / max(GOLDEN_INFER_MIN_SCORE, 1.0), 0.0, 1.0))
+    return {
+        'active': True,
+        'lane': best_idx + 1,
+        'remaining_s': None,
+        'source': 'tokens',
+        'confidence': confidence,
+        'lane_scores': [float(s) for s in lane_scores],
+        'green_counts': lane_green_counts,
+    }
+
+
 def detect_lane_curve(frame):
     """CL0-CL2 entry point + lightweight curve-bias readout (CL3-lite).
 
@@ -1210,6 +1311,13 @@ GOLDEN_LOG_ENABLED = True
 GOLDEN_LOG_PATH = os.path.join('logs', 'golden_lane.log')
 _golden_log_state = {'last_key': None, 'init': False}
 
+GOLDEN_DEBUG_ENABLED = True
+GOLDEN_DEBUG_INTERVAL_S = 0.5
+GOLDEN_DEBUG_LOG_PATH = os.path.join('logs', 'golden_lane_debug.log')
+GOLDEN_DEBUG_ROI_PATH = os.path.join('logs', 'golden_lane_roi.png')
+GOLDEN_DEBUG_MASK_PATH = os.path.join('logs', 'golden_lane_mask.png')
+_golden_debug_state = {'last_sample_at': 0.0, 'init': False}
+
 _golden_digit_templates = None
 
 
@@ -1239,6 +1347,66 @@ def _golden_log(active, lane, remaining_s, banner_pix):
             fh.write(
                 f"{ts}  active={int(bool(active))}  lane={lane_str}  "
                 f"remaining={rem_str}  banner_pix={banner_pix}\n"
+            )
+    except Exception:
+        pass
+
+
+def _golden_debug_sample(active, lane, remaining_s, banner_pix, roi, mask):
+    """Rate-limited Golden Lane diagnostics for ROI/HSV threshold tuning."""
+    if not GOLDEN_DEBUG_ENABLED:
+        return
+
+    now = time.monotonic()
+    if now - _golden_debug_state['last_sample_at'] < GOLDEN_DEBUG_INTERVAL_S:
+        return
+    _golden_debug_state['last_sample_at'] = now
+
+    try:
+        os.makedirs(os.path.dirname(GOLDEN_DEBUG_LOG_PATH), exist_ok=True)
+
+        # Save the exact ROI and binary mask currently used by detection.
+        cv2.imwrite(
+            GOLDEN_DEBUG_ROI_PATH,
+            cv2.resize(roi, None, fx=4, fy=4, interpolation=cv2.INTER_NEAREST),
+        )
+        cv2.imwrite(
+            GOLDEN_DEBUG_MASK_PATH,
+            cv2.resize(mask, None, fx=4, fy=4, interpolation=cv2.INTER_NEAREST),
+        )
+
+        hsv = cv2.cvtColor(roi, cv2.COLOR_BGR2HSV)
+        colourful = (hsv[:, :, 1] > 80) & (hsv[:, :, 2] > 100)
+        colour_pix = int(np.count_nonzero(colourful))
+        if colour_pix:
+            hue_values = hsv[:, :, 0][colourful]
+            hue_min = int(hue_values.min())
+            hue_mean = float(hue_values.mean())
+            hue_max = int(hue_values.max())
+        else:
+            hue_min, hue_mean, hue_max = None, None, None
+
+        ts = time.strftime('%H:%M:%S')
+        lane_str = str(lane) if lane is not None else '?'
+        rem_str = f"{remaining_s:.0f}s" if remaining_s is not None else '?'
+        hue_str = (
+            f"{hue_min}/{hue_mean:.1f}/{hue_max}"
+            if hue_mean is not None else "?/?/?"
+        )
+        mode = 'w' if not _golden_debug_state['init'] else 'a'
+        with open(GOLDEN_DEBUG_LOG_PATH, mode, encoding='utf-8') as fh:
+            if not _golden_debug_state['init']:
+                fh.write(f"# Golden Lane debug log (session started {ts})\n")
+                fh.write(
+                    "# time  active  lane  remaining  banner_pixels  "
+                    "colour_pixels  hue_min/mean/max  roi_wh\n"
+                )
+                _golden_debug_state['init'] = True
+            fh.write(
+                f"{ts}  active={int(bool(active))}  lane={lane_str}  "
+                f"remaining={rem_str}  banner_pix={banner_pix}  "
+                f"colour_pix={colour_pix}  hue={hue_str}  "
+                f"roi={roi.shape[1]}x{roi.shape[0]}\n"
             )
     except Exception:
         pass
@@ -1340,6 +1508,7 @@ def detect_golden_lane(frame):
     mask = cv2.inRange(hsv, *HSV_GOLDEN_BANNER)
     banner_pix = int(cv2.countNonZero(mask))
     if banner_pix < GOLDEN_BANNER_MIN_PIX:
+        _golden_debug_sample(False, None, None, banner_pix, roi, mask)
         _golden_log(False, None, None, banner_pix)
         return inactive
 
@@ -1357,6 +1526,7 @@ def detect_golden_lane(frame):
         countdown = _read_golden_digit(up, tx0 + GOLDEN_COUNT_DIGIT_XFRAC * tw)
         if countdown is not None:
             remaining_s = float(countdown)
+    _golden_debug_sample(True, lane, remaining_s, banner_pix, roi, mask)
     _golden_log(True, lane, remaining_s, banner_pix)
     return {'active': True, 'lane': lane, 'remaining_s': remaining_s}
 

@@ -35,6 +35,12 @@ from perception_types import FrontPerception, RearPerception
 CRUISE_THROTTLE = 0.8
 LOW_BRIGHTNESS_THROTTLE = -1.0
 
+# Golden Lane (Phase 17): aggressive steering gain used to snap the car onto a
+# target lane within the 5 s window. Higher than the normal attract gains so the
+# manoeuvre commits ("hard steer").
+GOLDEN_LANE_STEER_GAIN = 1.6
+GOLDEN_LANE_HOLD_BAND = 0.06   # |lane offset| under this = already in the lane
+
 # Red avoidance latch: once a red is detected ahead, commit to a full
 # lane-change away from it, then counter-steer briefly to settle.
 _red_avoid = {'until': 0.0, 'settle_until': 0.0, 'dir': 0}
@@ -185,6 +191,34 @@ def _compute_steering(
     return 0.0
 
 
+def steer_to_lane(
+    lane_grid: dict | None,
+    target_lane: int | None,
+) -> float | None:
+    """Hard-steer command (-1..+1) to drive the car onto ``target_lane`` (1..N).
+
+    Uses the bird's-eye lane grid from estimate_lane_grid(): each lane has a
+    signed centre offset (``lane_centers_norm``, positive => lane is to the
+    right of the car). Returns a committed steering value toward the target
+    lane's centre, or None when the grid/target is unavailable (so the caller
+    can fall back to normal lane keeping). Returns 0.0 when the car is already
+    within GOLDEN_LANE_HOLD_BAND of the target lane centre.
+
+    This is the primitive the Golden Lane handler uses to snap onto the inferred
+    golden lane within the 5 s window.
+    """
+    if not lane_grid or target_lane is None:
+        return None
+    centers = lane_grid.get('lane_centers_norm') or []
+    idx = int(target_lane) - 1
+    if idx < 0 or idx >= len(centers):
+        return None
+    offset = centers[idx]
+    if abs(offset) < GOLDEN_LANE_HOLD_BAND:
+        return 0.0
+    return float(np.clip(GOLDEN_LANE_STEER_GAIN * offset, -1.0, 1.0))
+
+
 def compute_control(
     front_per: FrontPerception | None,
     rear_per: RearPerception | None,
@@ -217,7 +251,24 @@ def compute_control(
         )
         accel = CRUISE_THROTTLE
 
+    # Golden Lane has top steering priority: snap to the announced lane and hold
+    # it for the 5 s window. Overrides normal steering (and steers through a
+    # darkness brake) whenever the lane is known and the grid is available.
+    golden = front_per.get('golden') if front_per else None
+    if golden and golden.get('active') and golden.get('lane'):
+        golden_steer = steer_to_lane(
+            front_per.get('lane_grid') if front_per else None,
+            golden['lane'],
+        )
+        if golden_steer is not None:
+            steering = golden_steer
+
     events_visible = []
+    if golden and golden.get('active'):
+        if golden.get('lane'):
+            events_visible.append(f"GOLDEN->L{golden['lane']}")
+        else:
+            events_visible.append('GOLDEN(?)')
     if police_seen:
         events_visible.append('POLICE->GRAB_RED')
     if force_lc:

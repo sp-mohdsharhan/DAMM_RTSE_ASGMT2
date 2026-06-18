@@ -135,9 +135,46 @@ Pair the screenshots in this doc with mask dumps from D1 before/after — visual
 
 ---
 
+## 4b. Golden Lane detection (Phase 17)
+
+Phase 17 (V3.0 Tactical Mode) adds the **Golden Lane** event: the game shows an
+orange banner `LANE N — ALL GREEN! (Xs)` near the top-centre (below the game
+timer). For 5 s every token in lane `N` is green, and the event is passed by
+being in lane `N` when the timer expires.
+
+**Detection (`detect_golden_lane(frame)` in `image_detection.py`):**
+
+1. Crop a top-centre banner ROI (`GOLDEN_BANNER_*_FRAC`) and HSV-threshold the
+   orange text (`HSV_GOLDEN_BANNER`). If the orange pixel count clears
+   `GOLDEN_BANNER_MIN_PIX`, the event is `active`.
+2. Upscale the banner mask and read the lane digit and countdown digit at their
+   expected fractional positions in the fixed message layout, using cached digit
+   templates (`1..N_LANES`) with a confidence + margin gate. Unconfident reads
+   return `None` so the caller can fall back to green-token lane inference.
+3. Returns `{'active', 'lane', 'remaining_s'}`.
+
+**Lane targeting:** `estimate_lane_grid()` slices the bird's-eye road span into
+`N_LANES = 5` lanes (left-to-right) and `control_policy.steer_to_lane()` hard-
+steers onto the announced lane. Golden Lane sits at the top of the steering
+priority (above police / chasing / token logic).
+
+**Review log:** every banner state change is appended to `logs/golden_lane.log`
+(`time  active  lane  remaining  banner_pix`). `banner_pix` is included so the
+`HSV_GOLDEN_BANNER` range and `GOLDEN_BANNER_MIN_PIX` floor can be tuned against
+real runs. Toggle with `GOLDEN_LOG_ENABLED`.
+
+**Open risks:** the HSV range and OCR thresholds were set from the plan /
+screenshot, not a captured frame, so they need validation against a real
+golden-lane run; the banner hue (8–26) overlaps the yellow-token range (16–32)
+but is separated by ROI location, and the green-token clustering fallback for
+unread lane digits is not yet wired.
+
+---
+
 ## 5. Relevant files
 
 - `image_detection.py` — module that owns detection, calibration, overlay
 - `sample_drive.py` — controller, event engine, RT scheduling; imports from `image_detection`
 - `plan.md` — broader project plan + tuning log (this doc focuses specifically on perception)
 - `screenshot/` — source evidence
+- `logs/golden_lane.log` — Golden Lane detection history (auto-generated per run)

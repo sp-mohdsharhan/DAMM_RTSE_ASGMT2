@@ -51,6 +51,8 @@ The controller uses a rule-based real-time perception and steering stack. It is 
 | Rear chasing-car detection | Detects the teal chasing car from the rear camera, crops out the sky band, applies morphology, gates by area and centre band, then confirms it is catching up using smoothed area growth across recent frames. |
 | Lane offset | Canny + HoughLinesP on the lower front ROI estimates lane-centre offset for overlay/debug. The current steering policy does not use this as the default fallback. |
 | Lane curve | Bird's-eye warp, Sobel/V-channel lane-pixel mask, histogram bases, and sliding-window pixel collection estimate a `curve_bias` used as a small anticipatory steering bias while seeking green tokens. |
+| Lane grid (1-5) | From the same bird's-eye lane-pixel mask, the road span is sliced into `N_LANES = 5` equal lanes numbered left-to-right. `estimate_lane_grid()` returns each lane's centre offset plus the car's current lane, giving the controller concrete lane targets for hard steering. |
+| Golden Lane banner | `detect_golden_lane()` thresholds the orange `LANE N - ALL GREEN! (Xs)` banner in a top-centre ROI (HSV range) to detect the event, then best-effort reads the lane digit (1-5) and countdown via digit templates. Detections are logged to `logs/golden_lane.log`. |
 | Hill/slope detection | Tracks the asphalt horizon using an EMA baseline. When the horizon deviates enough, the controller treats the road as a hill and triggers red/yellow evasion earlier. |
 | Low brightness | Mean V channel on a centre crop detects the low-light challenge. |
 
@@ -59,13 +61,14 @@ The controller uses a rule-based real-time perception and steering stack. It is 
 The steering decision is ordered from highest priority to lowest:
 
 1. **Low brightness recovery** - if the front frame is dim, steering is set to `0.0` and acceleration is set to `-1.0` to reverse/recover visibility.
-2. **Front police car** - if the police car is close and centred, dodge away from it. Otherwise, seek a red token, preferring one on the opposite side of the police car. If no red token is visible, ease away from the police side.
-3. **Rear chasing car** - if the rear teal car is growing in area, commit to a forced lane change for `1.5 s`. The lane-change direction alternates on each trigger.
-4. **Nearest imminent orb** - if any orb is within the IPM action distance (`ORB_ACT_DISTANCE = 120`), the nearest orb drives the action. If a red/yellow hazard is almost as near as a green (`ORB_TIE_MARGIN = 25`), hazard avoidance wins.
-5. **Green token seek** - steer toward green. If the green is clearly in another lane, commit to a stronger lane change and hold briefly so flicker does not cancel the manoeuvre.
-6. **Red token avoidance** - when a red token is ahead, commit to a full lane-change away from it for `1.6 s`, then counter-steer briefly for `0.35 s` to settle.
-7. **Yellow token avoidance** - dodge yellow only when it is sufficiently close and inside the centre path band.
-8. **Default** - go straight with cruise throttle.
+2. **Golden Lane** - when the Golden Lane banner is active and its lane number is read, hard-steer onto that lane (via `steer_to_lane()` and the lane grid) and hold until the window ends. This overrides the lower-priority steering below.
+3. **Front police car** - if the police car is close and centred, dodge away from it. Otherwise, seek a red token, preferring one on the opposite side of the police car. If no red token is visible, ease away from the police side.
+4. **Rear chasing car** - if the rear teal car is growing in area, commit to a forced lane change for `1.5 s`. The lane-change direction alternates on each trigger.
+5. **Nearest imminent orb** - if any orb is within the IPM action distance (`ORB_ACT_DISTANCE = 120`), the nearest orb drives the action. If a red/yellow hazard is almost as near as a green (`ORB_TIE_MARGIN = 25`), hazard avoidance wins.
+6. **Green token seek** - steer toward green. If the green is clearly in another lane, commit to a stronger lane change and hold briefly so flicker does not cancel the manoeuvre.
+7. **Red token avoidance** - when a red token is ahead, commit to a full lane-change away from it for `1.6 s`, then counter-steer briefly for `0.35 s` to settle.
+8. **Yellow token avoidance** - dodge yellow only when it is sufficiently close and inside the centre path band.
+9. **Default** - go straight with cruise throttle.
 
 Throttle policy:
 
@@ -87,6 +90,7 @@ Hill policy does not reduce throttle. It scales red/yellow trigger thresholds by
 | Yellow token | Yellow on-road orb in front camera | Avoid only when close and centred. |
 | Chasing car | Teal car in rear camera with growing area | Forced lane change, alternating direction per trigger. |
 | Police car | Red/blue police livery in front camera | Dodge if collision risk is high; otherwise seek a red token. |
+| Golden Lane | Orange `LANE N - ALL GREEN! (Xs)` banner in front camera | Read the lane number, hard-steer onto that lane via the lane grid, and hold until the window ends. |
 | Low brightness | Low mean V channel in front centre crop | Reverse with straight steering to recover. |
 | Hill/crest | Asphalt horizon deviates from flat-road EMA baseline | Trigger red/yellow avoidance earlier. |
 

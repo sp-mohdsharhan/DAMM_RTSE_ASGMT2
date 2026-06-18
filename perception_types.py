@@ -30,6 +30,16 @@ class FrontPerception(TypedDict, total=False):
     orbs: list[DetectionInfo]
     nearest: Optional[DetectionInfo]
     police: Optional[DetectionInfo]
+    golden: Optional['GoldenLane']
+    lane_grid: Optional['LaneGrid']
+
+
+class GoldenLane(TypedDict):
+    """Golden Lane banner readout from detect_golden_lane()."""
+
+    active: bool
+    lane: Optional[int]
+    remaining_s: Optional[float]
 
 
 class RearObjectState(TypedDict):
@@ -59,6 +69,20 @@ class CurveDebug(TypedDict, total=False):
     right_base: Optional[int]
     curve_bias: float
     lane_center_norm: Optional[float]
+    lane_grid: Optional['LaneGrid']
+
+
+class LaneGrid(TypedDict):
+    """Bird's-eye lane labelling (lanes 1..N, left-to-right) from estimate_lane_grid()."""
+
+    n_lanes: int
+    road_left: int
+    road_right: int
+    lane_width: float
+    lane_centers: list[float]
+    lane_centers_norm: list[float]
+    lane_bounds: list[float]
+    car_lane: Optional[int]
 
 
 class HudData(TypedDict):

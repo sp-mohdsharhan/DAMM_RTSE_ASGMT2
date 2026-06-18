@@ -9,6 +9,7 @@ from image_detection import (
     calibrate_step,
     calibration_done,
     detect_front_objects,
+    detect_golden_lane,
     detect_lane_curve,
     detect_lane_offset,
     detect_low_brightness,
@@ -37,6 +38,12 @@ def run_perception(front_frame, back_frame) -> PerceptionResult:
 
     curve_dbg = detect_lane_curve(front_frame)
     curve_bias = curve_dbg['curve_bias'] if curve_dbg else 0.0
+
+    # Phase 17: Golden Lane banner + the lane grid it steers onto. Attaching both
+    # to front_per keeps the perception tuple arity unchanged.
+    if front_per is not None:
+        front_per['golden'] = detect_golden_lane(front_frame)
+        front_per['lane_grid'] = curve_dbg.get('lane_grid') if curve_dbg else None
 
     slope = detect_slope(front_frame)
     hill = bool(slope and slope['is_hill'])

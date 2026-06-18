@@ -1,21 +1,19 @@
 # Plan: OpenCV Auto-Detection for SpeedTrials2D (RTSE Competition)
 
-> **Current status: Phase 16 implemented + Task 1 next.** The active controller is a
-> pure-perception V2.0 driver. The Unity simulator is the authoritative state
-> machine; our code does not track score, hit cooldowns, yellow-event state,
-> target speed, or police-active state in parallel.
+> **Current status: Phase 17 V3.0 Tactical Mode planning target.** Game day uses
+> the final V3.0 rules: Tactical win is the first priority, and distance travelled
+> at 180 seconds is only the tie-breaker / fallback objective.
 >
-> **Important:** Phases 1-13 are retained as design history. Some older sections
+> **Important:** Phases 1-16 are retained as design history. Some older sections
 > still say "current" because they were current at the time they were written.
-> For implementation decisions, use the newest phase at the bottom of this file,
-> `task1.md`, `sample_drive.py`, and `image_detection.py`.
+> For implementation decisions, use **Phase 17** at the bottom of this file,
+> then check `sample_drive.py`, `control_policy.py`, `perception_pipeline.py`,
+> `image_detection.py`, and `task1.md`.
 >
-> Current behaviour: front camera detects red/green/yellow tokens and the front
-> police car; rear camera detects only the teal chasing car; camera-dark/
-> corruption holds straight at cruise and must not reverse. Planned improvements
-> are confidence gating plus temporal confirmation, and a separate main-window
-> sampler for Challenge 1's `#020202` dim because the TCP camera feed cannot see
-> that effect.
+> Current implemented behaviour remains V2.0-style perception/control: front
+> camera detects red/green/yellow tokens and the front police car; rear camera
+> detects the teal chasing car. V3.0 adds Tactical scoring and Golden Lane, so
+> older V2.0 priorities are superseded by Phase 17.
 
 > **⚠ Status (Phase 3, current):** the shadow-state event engine described in Phases 1–2
 > below has been **removed**. The official rules poster (`game rule/RTSE_Poster_game.pdf`)
@@ -790,3 +788,171 @@ or unreliable.
 3. Normal driving and yellow camera-corruption events must not trigger reverse.
 4. Confirm over at least 3 runs that Challenge 1 no longer causes the -10% speed
    penalty window to persist.
+
+---
+
+## Phase 17 - Game Day V3.0 Tactical Mode (latest target)
+
+Final game-day build is **V3.0**. This phase supersedes V2.0 priority decisions
+for competition strategy. The code may still be camera-reactive, but the winning
+objective is no longer "drive as far as possible first".
+
+### V3.0 rule updates
+
+- Game time is extended to **3 minutes / 180 seconds**.
+- Winning priority is:
+  1. **Tactical win**
+  2. **Distance travelled at 180 seconds**
+- Tactical win condition:
+  - collect a net **+60 green tokens**
+  - net green = `green tokens - red tokens`
+  - pass at least once every event
+- New event: **Golden Lane**
+  - the game flashes/activates EV5, but the lane number is an **algorithm-side
+    lane label**, not necessarily an actual text number in the game
+  - for the next **5 seconds**, every token in that lane is green
+  - the event is passed by being on the inferred golden lane at the end of the 5 s
+    window
+
+### V3.0 event rotation
+
+| Event | Active timing / rotation |
+| --- | --- |
+| Darkness | `0-30s`, random |
+| Police Car | `30-50s`, random |
+| Chasing Car A | `0-30s`, random |
+| Chasing Car B | `50s` |
+| Golden Lane | `0-55s`, random |
+
+### V3.0 event pass conditions
+
+| Event | Pass requirement | Controller action |
+| --- | --- | --- |
+| EV1 - Darkness | Player must brake/decelerate fully | Send `acceleration_input = -1.0` while EV1 is active / being handled. |
+| EV2 - Police Car | Collect a red token within 5 s of police spawn; hitting police is game over | Detect police ahead, avoid collision, and prioritize the nearest safe red token immediately. |
+| EV3 - Chasing Car 1 | Avoid colliding with the chasing car | Use rear chasing-car detection and forced lane-change escape. |
+| EV4 - Chasing Car 2 | Avoid colliding with the chasing car | Same evasive handling as EV3, tracked with a separate pass flag. |
+| EV5 - Golden Lane | Be in the golden lane when the 5 s timer expires | Detect/infer the golden lane, steer into it, and hold lane until expiry. |
+
+### Implementation implications
+
+The controller now needs lightweight tactical state. This is not a full shadow
+simulation of Unity physics; it is competition bookkeeping for the V3.0 win
+condition.
+
+- Track game time from the first valid front frame.
+  - Add `run_start_time = None` initially.
+  - Set it with `time.monotonic()` when `processing_task` first receives a valid
+    front frame.
+  - Compute `elapsed_game_s = time.monotonic() - run_start_time`.
+  - Use `elapsed_game_s` for V3.0 event windows and the 180 s game-day timer.
+- Track token counters:
+  - `green_hits`
+  - `red_hits`
+  - `net_green = green_hits - red_hits`
+- Track event pass flags:
+  - `passed_darkness`
+  - `passed_police`
+  - `passed_chasing_a`
+  - `passed_chasing_b`
+  - `passed_golden_lane`
+- Track event timers/active windows for EV1-EV5, especially:
+  - EV1 Darkness random window: `0-30s`
+  - EV2 police 5 s red-token deadline
+  - EV3 Chasing Car A random window: `0-30s`
+  - EV4 Chasing Car B fixed trigger around `50s`
+  - EV5 Golden Lane 5 s lane-hold deadline
+- Expose tactical status in the HUD/log so the team can see whether the run is
+  chasing Tactical or only distance.
+  - HUD/log should include `elapsed_game_s` so the team can verify event timing
+    against the 180 s game clock.
+- Prefer green collection more aggressively while `net_green < 60`, but keep red
+  avoidance strong enough that red hits do not erase the net score.
+- Once Tactical requirements are satisfied, switch to distance-preserving driving
+  for the rest of the 180 s.
+
+### Lane numbering and Golden Lane handling
+
+Golden Lane is the new high-risk/high-value event because it requires detecting
+which road lane became golden and being in that lane exactly when the 5 s window
+ends.
+
+Algorithm-side lane numbering:
+
+- Number lanes **left to right from the driver's perspective**.
+- Based on the current game-day screenshot, use 5 lane labels: `1, 2, 3, 4, 5`.
+- These labels are for our code and debugging; they do not require visible lane
+  numbers in the game UI.
+
+Planned detector/strategy:
+
+1. Detect the EV5 active window from the main-window event indicators or a
+   timing/state hook.
+2. Estimate lane boundaries from the front camera:
+   - use lane markings / road edges in the lower road ROI
+   - map the car's current lateral position to lane `1..5`
+   - map each token centroid to lane `1..5`
+3. Infer the golden lane:
+   - during EV5, every token in one lane is green
+   - cluster visible green token centroids by lane
+   - choose the lane with the strongest / most consistent green-token evidence
+   - if evidence is weak, keep the previous inferred lane until contradicted
+4. Store:
+   - `golden_lane_active`
+   - `golden_lane_number`
+   - `golden_lane_deadline`
+5. Convert the inferred lane number into a target lane-centre position.
+6. During the active 5 s window, steer to the inferred lane and hold it until
+   the deadline.
+7. Mark `passed_golden_lane = True` only after the car is in the inferred lane
+   at the end of the window.
+
+If the lane number cannot be read from the game UI, do not treat that as a
+controller bug. The lane number is an internal algorithm label; the real detector
+should infer it from lane geometry and green-token distribution.
+
+### V3.0 tactical steering priority proposal
+
+Highest priority wins:
+
+1. **Golden Lane active** - move to the inferred golden lane and hold until the 5 s
+   pass deadline.
+2. **Darkness handling** - send full brake/deceleration (`acceleration_input = -1.0`)
+   while EV1 is active / being handled.
+3. **Police handling** - avoid police collision and collect a red token within
+   the 5 s EV2 deadline.
+4. **Chasing-car handling** - forced lane change / evasive manoeuvre for Chasing
+   Car A/B and mark the relevant pass flag.
+5. **Net-score strategy** - seek green, avoid red, and avoid unnecessary yellow
+   while `net_green < 60`.
+6. **Distance strategy** - after Tactical is complete, prioritize stable
+   high-distance driving until 180 s.
+
+### Validation checklist
+
+1. At 180 s, HUD/log can show `green_hits`, `red_hits`, and `net_green`.
+2. HUD/log shows pass flags for Darkness, Police, Chasing A, Chasing B, and
+   Golden Lane.
+3. Golden Lane lane is inferred as one of lanes `1..5` from lane geometry and
+   green-token distribution, or manually confirmed with the fallback hook during
+   testing.
+4. Tactical objective is attempted before distance optimization.
+5. Existing V2.0 behaviours still work unless overridden by Golden Lane or the
+   tactical scoring objective.
+6. Run at least 3 full 180 s trials and compare:
+   - Tactical success/failure
+   - final `net_green`
+   - events passed
+   - distance travelled
+
+### Open implementation decisions before coding
+
+- Confirm whether the final V3.0 track always uses 5 lanes. Default assumption:
+  lanes `1..5`, numbered left-to-right from the driver's perspective.
+- Confirm whether EV5 has a reliable main-window indicator. Lane number itself
+  should be inferred by code, not OCR-read as a UI number.
+- Decide how token hit counting will be observed:
+  - direct scoreboard/OCR if available, or
+  - conservative camera-based hit approximation using close orb crossing.
+- Define exact event-pass conditions for Darkness, Police, and Chasing A/B after
+  observing the final V3.0 build.

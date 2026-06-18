@@ -29,7 +29,7 @@ from image_detection import (
     YELLOW_AVOID_AREA_FRAC,
     YELLOW_AVOID_GAIN,
 )
-from perception_types import FrontPerception, RearPerception
+from perception_types import FrontPerception, RearPerception, TacticalSnapshot
 
 
 CRUISE_THROTTLE = 0.8
@@ -219,6 +219,32 @@ def steer_to_lane(
     return float(np.clip(GOLDEN_LANE_STEER_GAIN * offset, -1.0, 1.0))
 
 
+def _police_collision_risk(front_per: FrontPerception | None) -> bool:
+    police = front_per.get('police') if front_per else None
+    if police is None:
+        return False
+    return (
+        police['area_frac'] > POLICE_DODGE_AREA
+        and abs(police['centroid_x_norm']) < POLICE_DODGE_BAND
+    )
+
+
+def _steer_to_nearest_red(front_per: FrontPerception | None, curve_bias: float) -> float | None:
+    """Aggressive red-token seek for EV2 police pass."""
+    if not front_per:
+        return None
+
+    reds = [o for o in front_per.get('orbs', []) if o.get('color') == 'red']
+    target = min(reds, key=lambda o: o['distance']) if reds else front_per.get('red')
+    if target is None:
+        return None
+
+    cx = target['centroid_x_norm']
+    if abs(cx) > GREEN_LANE_CHANGE_BAND:
+        return float(np.clip(GREEN_SEEK_GAIN * (1 if cx > 0 else -1), -1.0, 1.0))
+    return float(np.clip(GREEN_ATTRACT_GAIN * cx + LANE_CURVE_GAIN * curve_bias, -1.0, 1.0))
+
+
 def compute_control(
     front_per: FrontPerception | None,
     rear_per: RearPerception | None,
@@ -226,6 +252,7 @@ def compute_control(
     hill: bool,
     low_light: bool,
     now: float,
+    tactical: TacticalSnapshot | None = None,
 ) -> tuple[float, float, list[str]]:
     """Return (steering, accel, events_visible) for the current perception frame."""
     global _lane_change_until, _lane_change_dir
@@ -251,6 +278,11 @@ def compute_control(
         )
         accel = CRUISE_THROTTLE
 
+    if tactical and tactical.get('police_active') and not _police_collision_risk(front_per):
+        red_seek = _steer_to_nearest_red(front_per, curve_bias)
+        if red_seek is not None:
+            steering = red_seek
+
     # Golden Lane has top steering priority: snap to the announced lane and hold
     # it for the 5 s window. Overrides normal steering (and steers through a
     # darkness brake) whenever the lane is known and the grid is available.
@@ -269,6 +301,17 @@ def compute_control(
             events_visible.append(f"GOLDEN->L{golden['lane']}")
         else:
             events_visible.append('GOLDEN(?)')
+    if tactical:
+        if tactical.get('police_active'):
+            time_left = tactical.get('police_time_left')
+            if time_left is not None:
+                events_visible.append(f"POLICE_RED:{time_left:.1f}s")
+            else:
+                events_visible.append('POLICE_RED')
+        elif tactical.get('passed_police'):
+            events_visible.append('POLICE_PASS')
+        elif tactical.get('police_timeout'):
+            events_visible.append('POLICE_TIMEOUT')
     if police_seen:
         events_visible.append('POLICE->GRAB_RED')
     if force_lc:

@@ -96,6 +96,17 @@ class HudData(TypedDict):
     acc: float
 
 
+class TacticalSnapshot(TypedDict):
+    """V3.0 tactical state consumed by policy/HUD."""
+
+    elapsed_game_s: float
+    police_active: bool
+    police_time_left: Optional[float]
+    passed_police: bool
+    police_timeout: bool
+    red_hits: int
+
+
 PerceptionResult = tuple[
     Optional[FrontPerception],
     Optional[RearPerception],

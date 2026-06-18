@@ -808,13 +808,24 @@ objective is no longer "drive as far as possible first".
   - net green = `green tokens - red tokens`
   - pass at least once every event
 - New event: **Golden Lane**
-  - the game flashes/activates EV5, but the lane number is an **algorithm-side
-    lane label**, not necessarily an actual text number in the game
+  - the game flashes/activates a Golden Lane event that can appear on **any event
+    slot** (`EV1, EV2, EV3, EV4, or EV5`) at random; it is **not fixed to EV5**
+  - the game shows a **text banner** near the top-centre (below the game timer)
+    of the form **`LANE N — ALL GREEN! (Xs)`**, where `N` is the golden lane
+    number (`1..5`, left-to-right) and `Xs` is a live countdown of the remaining
+    seconds
+  - the lane number `N` and remaining time can therefore be **read directly from
+    the banner** (preferred), with green-token clustering kept only as a fallback
   - for the next **5 seconds**, every token in that lane is green
-  - the event is passed by being on the inferred golden lane at the end of the 5 s
-    window
+  - the event is passed by being on the golden lane at the end of the 5 s window
 
 ### V3.0 event rotation
+
+> **Terminology:** `EV1-EV5` are **events** (Darkness, Police, Chasing A,
+> Chasing B, Golden Lane trigger), *not* lanes. Road **lanes** are a separate
+> concept numbered `1..5` left-to-right from the driver's view. The number 5
+> appearing in both (5 events, 5 lanes) is a coincidence; they never mean the
+> same thing.
 
 | Event | Active timing / rotation |
 | --- | --- |
@@ -822,7 +833,7 @@ objective is no longer "drive as far as possible first".
 | Police Car | `30-50s`, random |
 | Chasing Car A | `0-30s`, random |
 | Chasing Car B | `50s` |
-| Golden Lane | `0-55s`, random |
+| Golden Lane | `0-55s`, random; can fire on **any** event slot `EV1-EV5` |
 
 ### V3.0 event pass conditions
 
@@ -832,7 +843,7 @@ objective is no longer "drive as far as possible first".
 | EV2 - Police Car | Collect a red token within 5 s of police spawn; hitting police is game over | Detect police ahead, avoid collision, and prioritize the nearest safe red token immediately. |
 | EV3 - Chasing Car 1 | Avoid colliding with the chasing car | Use rear chasing-car detection and forced lane-change escape. |
 | EV4 - Chasing Car 2 | Avoid colliding with the chasing car | Same evasive handling as EV3, tracked with a separate pass flag. |
-| EV5 - Golden Lane | Be in the golden lane when the 5 s timer expires | Detect/infer the golden lane, steer into it, and hold lane until expiry. |
+| Golden Lane (random EV1-EV5) | Be in the golden lane when the 5 s timer expires | Detect/infer the golden lane, steer into it, and hold lane until expiry. Treated as an independent event that may overlap whichever event slot it lands on. |
 
 ### Implementation implications
 
@@ -861,7 +872,7 @@ condition.
   - EV2 police 5 s red-token deadline
   - EV3 Chasing Car A random window: `0-30s`
   - EV4 Chasing Car B fixed trigger around `50s`
-  - EV5 Golden Lane 5 s lane-hold deadline
+  - Golden Lane 5 s lane-hold deadline (random event slot `EV1-EV5`)
 - Expose tactical status in the HUD/log so the team can see whether the run is
   chasing Tactical or only distance.
   - HUD/log should include `elapsed_game_s` so the team can verify event timing
@@ -873,50 +884,60 @@ condition.
 
 ### Lane numbering and Golden Lane handling
 
-Golden Lane is the new high-risk/high-value event because it requires detecting
+Golden Lane is the new high-risk/high-value event because it requires knowing
 which road lane became golden and being in that lane exactly when the 5 s window
 ends.
 
-Algorithm-side lane numbering:
+**Game-day update (from the live screenshot):** the golden lane is announced by
+an on-screen banner **`LANE N — ALL GREEN! (Xs)`** at the top-centre, below the
+`163.9s`-style game timer. This means the lane number `N` and the remaining
+countdown `Xs` are presented as **readable text**, so the primary detector reads
+the banner instead of purely inferring the lane.
+
+Lane numbering:
 
 - Number lanes **left to right from the driver's perspective**.
 - Based on the current game-day screenshot, use 5 lane labels: `1, 2, 3, 4, 5`.
-- These labels are for our code and debugging; they do not require visible lane
-  numbers in the game UI.
+- The banner's `LANE N` uses the same `1..5` numbering, so the read value maps
+  straight onto our lane grid.
 
 Planned detector/strategy:
 
-1. Detect the EV5 active window from the main-window event indicators or a
-   timing/state hook.
-2. Estimate lane boundaries from the front camera:
-   - use lane markings / road edges in the lower road ROI
-   - map the car's current lateral position to lane `1..5`
-   - map each token centroid to lane `1..5`
-3. Infer the golden lane:
-   - during EV5, every token in one lane is green
+1. Detect the Golden Lane active window from the **banner** (top-centre orange
+   `LANE N — ALL GREEN! (Xs)` text). The trigger can land on any event slot
+   (`EV1-EV5`), so the detector keys off the banner itself, not an event number.
+2. Read the banner contents:
+   - parse the lane number `N` (`1..5`) and the remaining seconds `Xs`
+   - because the digit set is tiny (`1-5`), a small template/digit match over the
+     banner ROI is enough; a full OCR engine is optional
+3. Map `N` directly onto the lane grid from `estimate_lane_grid()`
+   (lanes `1..5`, left-to-right). No green-token inference is needed when the
+   banner is readable.
+4. Fallback only if the banner cannot be read (occlusion, dark event):
    - cluster visible green token centroids by lane
    - choose the lane with the strongest / most consistent green-token evidence
-   - if evidence is weak, keep the previous inferred lane until contradicted
-4. Store:
+   - if evidence is weak, keep the previous lane until contradicted
+5. Store:
    - `golden_lane_active`
    - `golden_lane_number`
-   - `golden_lane_deadline`
-5. Convert the inferred lane number into a target lane-centre position.
-6. During the active 5 s window, steer to the inferred lane and hold it until
-   the deadline.
-7. Mark `passed_golden_lane = True` only after the car is in the inferred lane
-   at the end of the window.
+   - `golden_lane_deadline` (derive from the banner's `Xs` countdown when read)
+6. Convert the lane number into a target lane-centre position via the lane grid
+   and `steer_to_lane()`.
+7. During the active window, hard-steer to that lane and hold it until the
+   deadline.
+8. Mark `passed_golden_lane = True` only after the car is in the golden lane at
+   the end of the window.
 
-If the lane number cannot be read from the game UI, do not treat that as a
-controller bug. The lane number is an internal algorithm label; the real detector
-should infer it from lane geometry and green-token distribution.
+The banner is the source of truth for the lane number. Only if the banner cannot
+be read (e.g. occlusion or a darkness event) should the detector fall back to
+inferring the lane from lane geometry and green-token distribution.
 
 ### V3.0 tactical steering priority proposal
 
 Highest priority wins:
 
-1. **Golden Lane active** - move to the inferred golden lane and hold until the 5 s
-   pass deadline.
+1. **Golden Lane active** - read the `LANE N` banner, move to lane `N`, and hold
+   until the 5 s pass deadline.
 2. **Darkness handling** - send full brake/deceleration (`acceleration_input = -1.0`)
    while EV1 is active / being handled.
 3. **Police handling** - avoid police collision and collect a red token within
@@ -933,9 +954,9 @@ Highest priority wins:
 1. At 180 s, HUD/log can show `green_hits`, `red_hits`, and `net_green`.
 2. HUD/log shows pass flags for Darkness, Police, Chasing A, Chasing B, and
    Golden Lane.
-3. Golden Lane lane is inferred as one of lanes `1..5` from lane geometry and
-   green-token distribution, or manually confirmed with the fallback hook during
-   testing.
+3. Golden Lane number is read from the `LANE N — ALL GREEN! (Xs)` banner (or, as
+   fallback, inferred from lane geometry and green-token distribution) and maps
+   to one of lanes `1..5`.
 4. Tactical objective is attempted before distance optimization.
 5. Existing V2.0 behaviours still work unless overridden by Golden Lane or the
    tactical scoring objective.
@@ -949,8 +970,10 @@ Highest priority wins:
 
 - Confirm whether the final V3.0 track always uses 5 lanes. Default assumption:
   lanes `1..5`, numbered left-to-right from the driver's perspective.
-- Confirm whether EV5 has a reliable main-window indicator. Lane number itself
-  should be inferred by code, not OCR-read as a UI number.
+- The Golden Lane event shows a top-centre banner `LANE N — ALL GREEN! (Xs)`, so
+  the lane number `N` and countdown are read directly from that banner ROI
+  (small digit/template match, `1-5`). Green-token clustering is only the
+  fallback when the banner is unreadable.
 - Decide how token hit counting will be observed:
   - direct scoreboard/OCR if available, or
   - conservative camera-based hit approximation using close orb crossing.

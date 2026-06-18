@@ -15,6 +15,7 @@ import ctypes
 from control_policy import compute_control
 from display_overlay import show_perception
 from perception_pipeline import run_perception
+from tactical_state import update_tactical_state
 
 
 # ---------------------------------------------------------
@@ -39,6 +40,7 @@ shared_data = {
     'accel_cmd': 0.0,
     'perception_front': {},
     'perception_back': {},   # V2.0: rear chasing car (Ch.2); front police is in perception_front
+    'tactical': {},
 }
 data_lock = threading.Lock()
 state_lock = threading.Lock()
@@ -235,13 +237,17 @@ def processing_task():
         hill,
     ) = run_perception(front_frame, back_frame)
 
+    now = time.monotonic()
+    tactical = update_tactical_state(front_per, now)
+
     steering, accel, events_visible = compute_control(
         front_per,
         rear_per,
         curve_bias,
         hill,
         low_light,
-        time.monotonic(),
+        now,
+        tactical,
     )
 
     with state_lock:
@@ -249,12 +255,17 @@ def processing_task():
         shared_data['accel_cmd'] = accel
         shared_data['perception_front'] = front_per or {}
         shared_data['perception_back'] = rear_per or {}
+        shared_data['tactical'] = tactical
+
+    hud_events = list(events_visible)
+    hud_events.append(f"T={tactical['elapsed_game_s']:.1f}s")
+    hud_events.append(f"R={tactical['red_hits']}")
 
     hud = {
         'target': accel * 100.0,
         'eff': accel * 100.0,
         'police': bool(front_per and front_per.get('police')),
-        'events': events_visible,
+        'events': hud_events,
         'str': steering,
         'acc': accel,
     }

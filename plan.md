@@ -814,8 +814,18 @@ objective is no longer "drive as far as possible first".
     of the form **`LANE N — ALL GREEN! (Xs)`**, where `N` is the golden lane
     number (`1..5`, left-to-right) and `Xs` is a live countdown of the remaining
     seconds
-  - the lane number `N` and remaining time can therefore be **read directly from
-    the banner** (preferred), with green-token clustering kept only as a fallback
+  - **Update (game-day build):** the patched game draws this banner **inside the
+    front-camera frame**, so `detect_golden_lane()` reads it directly. The lane
+    digit `N` is read by OCR; the `(Xs)` **countdown OCR is unreliable**, so the
+    controller does **not** use the remaining-seconds value.
+  - because the countdown can't be trusted, when the banner lane is read the
+    controller **latches lane `N` and holds it for a fixed 5 s lock**
+    (`GOLDEN_LANE_LOCK_S = 5.0` in `control_policy.py`, = the event duration),
+    re-arming only on a fresh detection (a different lane, or after the lock
+    expires)
+  - if the banner is active but the lane digit is unread, fall back to inferring
+    the lane from the strongest green-token concentration
+    (`infer_golden_lane_from_tokens()`)
   - for the next **5 seconds**, every token in that lane is green
   - the event is passed by being on the golden lane at the end of the 5 s window
 
@@ -888,65 +898,86 @@ Golden Lane is the new high-risk/high-value event because it requires knowing
 which road lane became golden and being in that lane exactly when the 5 s window
 ends.
 
-**Game-day update (from the live screenshot):** the golden lane is announced by
-an on-screen banner **`LANE N — ALL GREEN! (Xs)`** at the top-centre, below the
-`163.9s`-style game timer. This means the lane number `N` and the remaining
-countdown `Xs` are presented as **readable text**, so the primary detector reads
-the banner instead of purely inferring the lane.
+**Game-day update (current build):** the golden lane is announced by an on-screen
+banner **`LANE N — ALL GREEN! (Xs)`** at the top-centre, below the `163.9s`-style
+game timer. On the patched game-day build this banner **is present in the
+front-camera frame**, so `detect_golden_lane()` reads the lane number `N` by OCR
+and drives the trigger directly. The `(Xs)` countdown OCR is **unreliable** and
+is not consumed by the controller; instead the lane is held for a fixed 5 s lock
+(see below). Green-token inference (`infer_golden_lane_from_tokens()`) remains the
+fallback for frames where the banner lane digit is unread or no banner is seen.
 
 Lane numbering:
 
 - Number lanes **left to right from the driver's perspective**.
 - Based on the current game-day screenshot, use 5 lane labels: `1, 2, 3, 4, 5`.
-- The banner's `LANE N` uses the same `1..5` numbering, so the read value maps
-  straight onto our lane grid.
+- If a future main-window capture/OCR path reads the banner, its `LANE N` value
+  should map straight onto the same `1..5` lane grid.
 
-Planned detector/strategy:
+Current detector/strategy:
 
-1. Detect the Golden Lane active window from the **banner** (top-centre orange
-   `LANE N — ALL GREEN! (Xs)` text). The trigger can land on any event slot
-   (`EV1-EV5`), so the detector keys off the banner itself, not an event number.
-2. Read the banner contents:
-   - parse the lane number `N` (`1..5`) and the remaining seconds `Xs`
-   - because the digit set is tiny (`1-5`), a small template/digit match over the
-     banner ROI is enough; a full OCR engine is optional
-3. Map `N` directly onto the lane grid from `estimate_lane_grid()`
-   (lanes `1..5`, left-to-right). No green-token inference is needed when the
-   banner is readable.
-4. Fallback only if the banner cannot be read (occlusion, dark event):
-   - cluster visible green token centroids by lane
-   - choose the lane with the strongest / most consistent green-token evidence
-   - if evidence is weak, keep the previous lane until contradicted
-5. Store:
-   - `golden_lane_active`
-   - `golden_lane_number`
-   - `golden_lane_deadline` (derive from the banner's `Xs` countdown when read)
+1. **`detect_golden_lane()` is the primary trigger.** It reads the orange banner
+   in the front-camera frame: if the orange pixel count clears the floor the event
+   is `active`, and the lane digit `N` is read by OCR. The `(Xs)` countdown digit
+   is read best-effort but is **unreliable and not consumed** by the controller.
+2. Use `infer_golden_lane_from_tokens(front_per, lane_grid)` as the **fallback**
+   when the banner is active but the lane digit is unread, or no banner is seen:
+   - project visible tokens into the bird's-eye lane grid
+   - score each lane by green-token concentration
+   - require enough green count and dominance before declaring an active lane
+3. `perception_pipeline` prefers the banner lane and falls back to token
+   inference; both map onto the lane grid from `estimate_lane_grid()`
+   (lanes `1..5`, left-to-right).
+4. If evidence is weak (no banner lane and weak token concentration), do not
+   trigger Golden Lane. Prefer normal green seeking over a false hard-steer into
+   the wrong lane.
+5. **Fixed 5 s lock instead of a deadline.** Since the countdown can't be read,
+   `control_policy` latches the announced lane and holds it for
+   `GOLDEN_LANE_LOCK_S = 5.0 s` (the event duration), re-arming only on a fresh
+   detection (a different lane, or after the lock expires). Continued/flickering
+   detection does not refresh the timer, so it stays anchored to first detection.
+   State held: `_golden_lock = {'lane', 'until'}`.
 6. Convert the lane number into a target lane-centre position via the lane grid
    and `steer_to_lane()`.
-7. During the active window, hard-steer to that lane and hold it until the
-   deadline.
+7. During the 5 s lock, hard-steer to that lane and hold it **even on frames with
+   no golden evidence**, so detection flicker mid-crossing still completes.
 8. Mark `passed_golden_lane = True` only after the car is in the golden lane at
-   the end of the window.
+   the end of the window. *(Pass-flag bookkeeping is not yet wired into
+   `tactical_state.py`.)*
 
-The banner is the source of truth for the lane number. Only if the banner cannot
-be read (e.g. occlusion or a darkness event) should the detector fall back to
-inferring the lane from lane geometry and green-token distribution.
+Known limitations:
+- **No true countdown.** The fixed 5 s lock is anchored to first detection, which
+  may lag the real event start, so the lock can end slightly before/after the
+  game's actual window. A future main-window OCR path could supply the real
+  deadline.
+- **Yellow debuff blocks the token fallback.** If the banner digit is unread and a
+  yellow token is hit before/during Golden Lane, the negative camera effect can
+  hide tokens or render them white/unknown, leaving no green evidence for the
+  fallback. Once any lane is latched, the 5 s lock still holds the manoeuvre
+  through such flicker. This is one reason yellow avoidance matters before the
+  Golden Lane window.
 
 ### V3.0 tactical steering priority proposal
 
 Highest priority wins:
 
-1. **Golden Lane active** - read the `LANE N` banner, move to lane `N`, and hold
-   until the 5 s pass deadline.
-2. **Darkness handling** - send full brake/deceleration (`acceleration_input = -1.0`)
+1. **Police emergency** - when the front police car is detected, take over
+   steering immediately. Dodge if collision risk is high; otherwise seek a red
+   token to satisfy the EV2 pass requirement.
+2. **Chasing-car emergency** - when the rear teal chasing car is detected and no
+   police is visible, commit to the forced lane-change escape immediately, even
+   if this interrupts Golden Lane or token collection.
+3. **Golden Lane active** - read lane `N` from the orange banner
+   (`detect_golden_lane()`), or infer it from green-token concentration when the
+   digit is unread; move to lane `N` and hold it for the fixed 5 s lock. The
+   countdown is not read, so the lock duration stands in for the pass deadline.
+4. **Darkness handling** - send full brake/deceleration (`acceleration_input = -1.0`)
    while EV1 is active / being handled.
-3. **Police handling** - avoid police collision and collect a red token within
-   the 5 s EV2 deadline.
-4. **Chasing-car handling** - forced lane change / evasive manoeuvre for Chasing
-   Car A/B and mark the relevant pass flag.
-5. **Net-score strategy** - seek green, avoid red, and avoid unnecessary yellow
+5. **Chasing-car pass tracking** - mark the relevant pass flag for Chasing Car
+   A/B after the evasive manoeuvre avoids collision.
+6. **Net-score strategy** - seek green, avoid red, and avoid unnecessary yellow
    while `net_green < 60`.
-6. **Distance strategy** - after Tactical is complete, prioritize stable
+7. **Distance strategy** - after Tactical is complete, prioritize stable
    high-distance driving until 180 s.
 
 ### Validation checklist
@@ -954,9 +985,10 @@ Highest priority wins:
 1. At 180 s, HUD/log can show `green_hits`, `red_hits`, and `net_green`.
 2. HUD/log shows pass flags for Darkness, Police, Chasing A, Chasing B, and
    Golden Lane.
-3. Golden Lane number is read from the `LANE N — ALL GREEN! (Xs)` banner (or, as
-   fallback, inferred from lane geometry and green-token distribution) and maps
-   to one of lanes `1..5`.
+3. Golden Lane number is read from the front-camera banner (`detect_golden_lane()`)
+   or, when the digit is unread, inferred from green-token distribution; either
+   maps to one of lanes `1..5`. The car latches that lane and holds it for the
+   fixed 5 s lock (the `(Xs)` countdown is not consumed).
 4. Tactical objective is attempted before distance optimization.
 5. Existing V2.0 behaviours still work unless overridden by Golden Lane or the
    tactical scoring objective.
@@ -970,10 +1002,12 @@ Highest priority wins:
 
 - Confirm whether the final V3.0 track always uses 5 lanes. Default assumption:
   lanes `1..5`, numbered left-to-right from the driver's perspective.
-- The Golden Lane event shows a top-centre banner `LANE N — ALL GREEN! (Xs)`, so
-  the lane number `N` and countdown are read directly from that banner ROI
-  (small digit/template match, `1-5`). Green-token clustering is only the
-  fallback when the banner is unreadable.
+- The Golden Lane event shows a top-centre banner `LANE N — ALL GREEN! (Xs)`.
+  On the game-day build this banner appears in the front-camera frame, so
+  `detect_golden_lane()` reads the lane digit `N` as the primary trigger, with
+  green-token clustering as fallback. The `(Xs)` countdown OCR is unreliable, so
+  the controller holds the lane with a fixed 5 s lock rather than a read deadline.
+  A main-window capture/OCR path for the true countdown remains a future upgrade.
 - Decide how token hit counting will be observed:
   - direct scoreboard/OCR if available, or
   - conservative camera-based hit approximation using close orb crossing.

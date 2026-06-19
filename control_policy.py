@@ -44,6 +44,20 @@ GOLDEN_LANE_MIN_CONFIDENCE = 0.25
 GOLDEN_LANE_MIN_GAIN_SCALE = 0.45
 GOLDEN_LANE_CURVE_SOFTEN = 0.45
 
+# Golden Lane lock window (s). detect_golden_lane() reads the lane number N from
+# the orange "LANE N - ALL GREEN!" banner in the camera frame, but the banner's
+# (Xs) countdown OCR is unreliable, so we do not know the true remaining time.
+# Detection also flickers (banner re-reads, greens get collected, or a yellow
+# debuff hides tokens). So once a lane is announced we latch the lane number and
+# hold it for this fixed window instead of re-deciding per frame: a flicker
+# mid-crossing still completes and we stay in the lane. Matches the game's 5 s
+# Golden Lane duration.
+GOLDEN_LANE_LOCK_S = 5.0
+
+# Golden Lane lock latch: remembers the inferred lane and the time the lock
+# expires. Re-arms only on a fresh detection (different lane, or after expiry).
+_golden_lock = {'until': 0.0, 'lane': None}
+
 # Red avoidance latch: once a red is detected ahead, commit to a full
 # lane-change away from it, then counter-steer briefly to settle.
 _red_avoid = {'until': 0.0, 'settle_until': 0.0, 'dir': 0}
@@ -320,27 +334,42 @@ def compute_control(
         if red_seek is not None:
             steering = red_seek
 
-    # Golden Lane overrides normal front-camera steering, but not the rear
-    # chasing-car escape above.
-    if not police_seen and not force_lc and golden and golden.get('active') and golden.get('lane'):
+    # Golden Lane: latch the inferred lane and lock onto it for GOLDEN_LANE_LOCK_S
+    # seconds. Token inference cannot read the 5 s banner countdown and flickers,
+    # so once a lane is declared we re-arm only on a fresh detection (a different
+    # lane, or after the previous lock expired) and otherwise let the timer run
+    # down from the first detection -- continued/flickering detection does not
+    # refresh it.
+    if golden and golden.get('active') and golden.get('lane'):
+        lane = int(golden['lane'])
+        if lane != _golden_lock['lane'] or now >= _golden_lock['until']:
+            _golden_lock['lane'] = lane
+            _golden_lock['until'] = now + GOLDEN_LANE_LOCK_S
+
+    golden_locked = now < _golden_lock['until'] and _golden_lock['lane'] is not None
+
+    # The lock overrides normal front-camera steering, but not police or the rear
+    # chasing-car escape above. It holds even when the current frame has no golden
+    # evidence, so a flicker mid-crossing still completes the lane change.
+    if not police_seen and not force_lc and golden_locked:
         golden_steer = steer_to_lane(
             front_per.get('lane_grid') if front_per else None,
-            golden['lane'],
+            _golden_lock['lane'],
             curve_bias,
         )
         if golden_steer is not None:
             steering = golden_steer
 
     events_visible = []
-    if golden and golden.get('active'):
-        if golden.get('lane'):
-            source = golden.get('source')
-            if source == 'tokens':
-                events_visible.append(f"GOLDEN(tok)->L{golden['lane']}")
-            else:
-                events_visible.append(f"GOLDEN->L{golden['lane']}")
-        else:
-            events_visible.append('GOLDEN(?)')
+    if golden_locked:
+        remaining = _golden_lock['until'] - now
+        source = golden.get('source') if golden else None
+        tag = 'tok' if source == 'tokens' else 'banner'
+        events_visible.append(
+            f"GOLDEN_LOCK({tag})->L{_golden_lock['lane']} {remaining:.1f}s"
+        )
+    elif golden and golden.get('active') and not golden.get('lane'):
+        events_visible.append('GOLDEN(?)')
     if tactical:
         if tactical.get('police_active'):
             time_left = tactical.get('police_time_left')

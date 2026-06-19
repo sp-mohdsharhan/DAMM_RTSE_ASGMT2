@@ -155,8 +155,25 @@ being in lane `N` when the timer expires.
 
 **Lane targeting:** `estimate_lane_grid()` slices the bird's-eye road span into
 `N_LANES = 5` lanes (left-to-right) and `control_policy.steer_to_lane()` hard-
-steers onto the announced lane. Golden Lane sits at the top of the steering
-priority (above police / chasing / token logic).
+steers onto the announced lane. Golden Lane overrides the normal token steering,
+but still yields to the police emergency and the rear chasing-car escape, which
+remain higher priority (collision = game over).
+
+**Countdown is not relied on — fixed 5 s lock.** The lane digit reads reliably,
+but the `(Xs)` countdown OCR does not, so the controller ignores `remaining_s`.
+Instead, when a banner lane is announced, `control_policy` latches the lane
+number and holds it for `GOLDEN_LANE_LOCK_S = 5.0 s` (the event duration),
+re-arming only on a fresh detection (a different lane, or after the lock
+expires). This keeps the car in the lane through detection flicker without
+needing the true countdown. The HUD shows `GOLDEN_LOCK(banner)->L# Xs` (or
+`(tok)` when the lane came from the token-inference fallback) with a local
+count-down of the lock, not the game's timer.
+
+**Fallback when the lane digit is unread:** `infer_golden_lane_from_tokens()`
+projects detected tokens into the lane grid and picks the lane with the strongest
+green-token concentration. `perception_pipeline` prefers the banner lane and
+falls back to token inference when the banner is active but the digit is
+unconfident, or no banner is seen.
 
 **Review log:** every banner state change is appended to `logs/golden_lane.log`
 (`time  active  lane  remaining  banner_pix`). `banner_pix` is included so the
@@ -166,8 +183,9 @@ real runs. Toggle with `GOLDEN_LOG_ENABLED`.
 **Open risks:** the HSV range and OCR thresholds were set from the plan /
 screenshot, not a captured frame, so they need validation against a real
 golden-lane run; the banner hue (8–26) overlaps the yellow-token range (16–32)
-but is separated by ROI location, and the green-token clustering fallback for
-unread lane digits is not yet wired.
+but is separated by ROI location. The `(Xs)` countdown digit in particular reads
+unreliably, which is why the controller uses the fixed 5 s lock above instead of
+the OCR'd remaining time.
 
 ---
 

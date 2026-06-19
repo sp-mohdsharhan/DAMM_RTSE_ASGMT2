@@ -52,7 +52,7 @@ The controller uses a rule-based real-time perception and steering stack. It is 
 | Lane offset | Canny + HoughLinesP on the lower front ROI estimates lane-centre offset for overlay/debug. The current steering policy does not use this as the default fallback. |
 | Lane curve | Bird's-eye warp, Sobel/V-channel lane-pixel mask, histogram bases, and sliding-window pixel collection estimate a `curve_bias` used as a small anticipatory steering bias while seeking green tokens. |
 | Lane grid (1-5) | From the same bird's-eye lane-pixel mask, the road span is sliced into `N_LANES = 5` equal lanes numbered left-to-right. `estimate_lane_grid()` returns each lane's centre offset plus the car's current lane, giving the controller concrete lane targets for hard steering. |
-| Golden Lane inference | The `LANE N - ALL GREEN! (Xs)` banner is drawn on the main SpeedTrials2D window, not the front-camera socket frame. The current camera-only fallback uses `infer_golden_lane_from_tokens()` to project detected tokens into the lane grid and choose the lane with the strongest green-token concentration. Banner ROI debug logs remain available in `logs/`, but they are not the practical trigger from camera input. |
+| Golden Lane | The patched game draws the orange `LANE N - ALL GREEN! (Xs)` banner in the front-camera frame. `detect_golden_lane()` reads the lane number `N` by OCR; the `(Xs)` countdown OCR is unreliable, so the controller ignores it. When the banner lane is read, `control_policy` latches that lane and holds it for a fixed `GOLDEN_LANE_LOCK_S = 5.0 s` (the event duration). When the banner is active but the digit is unread (or no banner is seen), `infer_golden_lane_from_tokens()` falls back to the lane with the strongest green-token concentration. |
 | Hill/slope detection | Tracks the asphalt horizon using an EMA baseline. When the horizon deviates enough, the controller treats the road as a hill and triggers red/yellow evasion earlier. |
 | Low brightness | Mean V channel on a centre crop detects the low-light challenge. |
 
@@ -63,7 +63,7 @@ The steering decision is ordered from highest priority to lowest:
 1. **Front police car** - if police is detected, immediately take over steering. If it is close and centred, dodge away from it; otherwise seek a red token, preferring one on the opposite side of the police car. The HUD shows `POLICE_PRIORITY`.
 2. **Rear chasing car** - if the rear teal car is detected, immediately commit to a forced lane change for `1.5 s` regardless of front-camera goals. The HUD shows `CHASING_CAR_PRIORITY`.
 3. **Low brightness recovery** - if the front frame is dim, steering is set to `0.0` and acceleration is set to `-1.0` to reverse/recover visibility.
-4. **Golden Lane** - when token clustering infers a Golden Lane, hard-steer onto that lane via `steer_to_lane()` and the lane grid. The HUD shows `GOLDEN(tok)->L#` for this camera-based path. This overrides the lower-priority steering below.
+4. **Golden Lane** - when the orange banner is read (or token clustering infers the lane), latch that lane and hard-steer onto it via `steer_to_lane()` and the lane grid, holding for a fixed `5.0 s` lock. The HUD shows `GOLDEN_LOCK(banner)->L# Xs` (or `(tok)` for the token-inference fallback), where `Xs` counts down the local lock, not the game timer. This overrides the lower-priority steering below.
 5. **Nearest imminent orb** - if any orb is within the IPM action distance (`ORB_ACT_DISTANCE = 120`), the nearest orb drives the action. If a red/yellow hazard is almost as near as a green (`ORB_TIE_MARGIN = 25`), hazard avoidance wins.
 6. **Green token seek** - steer toward green. If the green is clearly in another lane, commit to a stronger lane change and hold briefly so flicker does not cancel the manoeuvre.
 7. **Red token avoidance** - when a red token is ahead, commit to a full lane-change away from it for `1.6 s`, then counter-steer briefly for `0.35 s` to settle.
@@ -90,7 +90,7 @@ Hill policy does not reduce throttle. It scales red/yellow trigger thresholds by
 | Yellow token | Yellow on-road orb in front camera | Avoid only when close and centred. |
 | Chasing car | Teal car in rear camera | Highest-priority forced lane change, alternating direction per trigger. |
 | Police car | Red/blue police livery in front camera | Highest-priority steering: dodge if collision risk is high; otherwise seek a red token. |
-| Golden Lane | Green-token concentration in one lane from the front camera; text banner exists only on the main game window | Infer the lane, hard-steer onto that lane via the lane grid, and hold while the evidence remains active. |
+| Golden Lane | Orange `LANE N - ALL GREEN!` banner read from the front camera (lane digit via OCR; countdown unreliable), with green-token concentration as fallback | Steer onto lane `N` via the lane grid and hold it with a fixed 5 s lock (the event duration), since the countdown cannot be read reliably. |
 | Low brightness | Low mean V channel in front centre crop | Reverse with straight steering to recover. |
 | Hill/crest | Asphalt horizon deviates from flat-road EMA baseline | Trigger red/yellow avoidance earlier. |
 
@@ -249,4 +249,5 @@ Our implementation lives in the editable regions and supporting modules:
 
 ### Known Limitations
 
-- **Golden Lane camera inference can be blocked by yellow-token debuffs.** If the car hits a yellow token before or during Golden Lane, the game can apply a negative camera effect where tokens disappear or temporarily appear white/unknown. During that window, the front camera may not contain enough green-token evidence for `infer_golden_lane_from_tokens()` to identify the golden lane, so the hard-steer trigger can be delayed or missed.
+- **Golden Lane countdown is not read; the lock is a fixed 5 s.** `detect_golden_lane()` reads the lane number from the banner, but the `(Xs)` countdown OCR is unreliable, so the controller cannot know the true remaining time. It instead holds the lane for a fixed `GOLDEN_LANE_LOCK_S = 5.0 s` anchored to the first detection. Because detection can lag the real event start, the lock may end slightly before or after the game's actual window. A future main-window OCR path could supply the true deadline.
+- **Token-inference fallback can be blocked by yellow-token debuffs.** If the banner lane digit is unread and the car hits a yellow token before/during Golden Lane, the game can apply a negative camera effect where tokens disappear or appear white/unknown. During that window the front camera may lack green-token evidence for `infer_golden_lane_from_tokens()`, so the fallback trigger can be delayed or missed. Once any lane is latched, though, the 5 s lock holds the manoeuvre through such flicker.

@@ -1718,6 +1718,13 @@ def detect_golden_lane(frame):
             remaining_s = float(countdown)
     _golden_debug_sample(True, lane, remaining_s, banner_pix, roi, mask)
     _golden_log(True, lane, remaining_s, banner_pix)
+
+    print(
+        f"[GOLDEN] active={banner_pix >= GOLDEN_BANNER_MIN_PIX} "
+        f"lane={lane} remaining={remaining_s} "
+        f"banner_pix={banner_pix} "
+        f"text_pix={cv2.countNonZero(text_mask)}"
+    )
     return {'active': True, 'lane': lane, 'remaining_s': remaining_s}
 
 

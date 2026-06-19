@@ -128,10 +128,10 @@ RED_LANE_CHANGE_DURATION_S = 1.6         # matches LANE_CHANGE_DURATION_S — gu
 RED_SETTLE_DURATION_S = 0.35             # brief counter-steer to straighten out after the swerve
 YELLOW_AVOID_AREA_FRAC = 0.02            # bbox/ROI area to trigger yellow avoidance
 CENTER_BAND_FRAC = 0.55                  # |x_norm| < this counts as "in path"
-LANE_CHANGE_DURATION_S = 1.5             # trailing-car defensive swerve
-LANE_CHANGE_STEER = 0.8
+LANE_CHANGE_DURATION_S = 2.5             # trailing-car defensive swerve
+LANE_CHANGE_STEER = 0.5
 
-GREEN_ATTRACT_GAIN = 0.6                 # fine-track gain once green is lined up ahead
+GREEN_ATTRACT_GAIN = 0.8                 # fine-track gain once green is lined up ahead
 GREEN_ATTRACT_MIN_AREA = 0.004           # act on greens a touch earlier (commit the lane change in time)
 # Green pursuit: a gentle proportional pull can't cross a lane for an
 # adjacent-lane green (far greens have a tiny centroid offset). So commit to a
@@ -140,16 +140,25 @@ GREEN_ATTRACT_MIN_AREA = 0.004           # act on greens a touch earlier (commit
 GREEN_LANE_CHANGE_BAND = 0.92            # |centroid_x_norm| above this => green is in another lane -> commit
 GREEN_SEEK_GAIN = 1.0                    # committed steer magnitude toward an off-lane green
 GREEN_SEEK_HOLD_S = 1.0                  # bridge frames where green flickers / leaves ROI mid-cross
+# Near-green collect commit: once a green is THIS close (bird's-eye distance,
+# smaller = nearer) we stop initiating lane changes toward it. A near green's
+# centroid_x_norm magnifies as it drops to the frame bottom, which would
+# otherwise cross GREEN_LANE_CHANGE_BAND and swerve us off it right before
+# contact — fine when fast (we pass through first), but a slow car misses it. So
+# when this near we hold a gentle correction and just drive onto it. Red/yellow
+# are unaffected (their late swerve is the desired avoidance).
+GREEN_COMMIT_DISTANCE = 45.0            # within this -> commit to collecting, no lane change
+GREEN_COMMIT_MAX_STEER = 0.30          # clamp the gentle steer while committed
 # (Keep-LEFT / keep-RIGHT home-lane bias removed — the car now centres in the
 #  lane and reacts to orbs. See plan.md Phase 5 to restore a home-lane hug.)
-RED_AVOID_GAIN = 0.7                     # full-lock swerve when red is in path
-YELLOW_AVOID_GAIN = 0.5
+RED_AVOID_GAIN = 0.8                     # full-lock swerve when red is in path
+YELLOW_AVOID_GAIN = 0.7
 LANE_GAIN = 0.6
 
 # Lane-curve steering bias: how strongly the anticipated bend from
 # detect_lane_curve() biases steering on top of the instantaneous lane offset.
 # Lets the car steer into a curve before the near lane offset has moved.
-LANE_CURVE_GAIN = 0.4
+LANE_CURVE_GAIN = 0.5
 
 # Hill / slope handling (consumed by the controller in sample_drive.py).
 # On a crest the road horizon shifts up and orbs appear with little reaction
@@ -167,6 +176,15 @@ SLOPE_GAP_TOL = 8                        # rows of non-road (lane dashes) tolera
 
 # Low-brightness event detection (poster: "low brightness — turn light on or all tokens yellow")
 LOW_BRIGHTNESS_THRESHOLD = 45            # mean V channel below this -> consider it dim
+
+# Low-light image recovery (Challenge 1). When the scene is dim we don't just
+# react — we brighten the frame BEFORE detection so HSV thresholds keep working
+# in the dark. CLAHE (adaptive local contrast) on the V channel + a gamma lift.
+# Toggle here mirrors DETECTION_MODE / TRACKING_ENABLED.
+LOW_LIGHT_BOOST_ENABLED = True
+LOW_LIGHT_CLAHE_CLIP = 3.0               # higher -> stronger local contrast
+LOW_LIGHT_CLAHE_TILE = 8                 # CLAHE tile grid (TILE x TILE)
+LOW_LIGHT_GAMMA = 0.6                    # <1.0 brightens midtones; 1.0 = off
 
 # ---------------------------------------------------------------------------
 # HSV ranges & auto-calibration state
@@ -1354,6 +1372,47 @@ def detect_low_brightness(frame):
     #)
 
     return is_low
+
+
+# Cached CLAHE object and gamma LUT (built once; CLAHE is stateless per-apply).
+_clahe = None
+_gamma_lut = None
+
+
+def _get_low_light_tools():
+    global _clahe, _gamma_lut
+    if _clahe is None:
+        _clahe = cv2.createCLAHE(
+            clipLimit=LOW_LIGHT_CLAHE_CLIP,
+            tileGridSize=(LOW_LIGHT_CLAHE_TILE, LOW_LIGHT_CLAHE_TILE),
+        )
+    if _gamma_lut is None:
+        # out = 255 * (in/255) ** gamma. With gamma < 1 the exponent pulls dark
+        # midtones UP (brightens); gamma = 1 is identity.
+        g = max(1e-3, LOW_LIGHT_GAMMA)
+        _gamma_lut = np.array(
+            [((i / 255.0) ** g) * 255 for i in range(256)], dtype=np.uint8
+        )
+    return _clahe, _gamma_lut
+
+
+def boost_low_light(frame, is_low):
+    """Brighten a dim frame so HSV detection survives the low-light event (Ch.1).
+
+    Returns the ORIGINAL frame untouched unless LOW_LIGHT_BOOST_ENABLED is True
+    AND is_low is True — so normal-light frames and the disabled toggle are exact
+    no-ops. Applies CLAHE (adaptive local contrast) to the HSV value channel,
+    then a gamma lift, lifting the orbs back above the pinned HSV value floors
+    without blowing out the already-bright pixels."""
+    if frame is None or not LOW_LIGHT_BOOST_ENABLED or not is_low:
+        return frame
+    clahe, lut = _get_low_light_tools()
+    hsv = cv2.cvtColor(frame, cv2.COLOR_BGR2HSV)
+    v = clahe.apply(hsv[:, :, 2])
+    if LOW_LIGHT_GAMMA != 1.0:
+        v = cv2.LUT(v, lut)
+    hsv[:, :, 2] = v
+    return cv2.cvtColor(hsv, cv2.COLOR_HSV2BGR)
 
 
 # ---------------------------------------------------------------------------

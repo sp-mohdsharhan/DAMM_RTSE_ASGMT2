@@ -9,6 +9,7 @@ import os
 import time
 
 from image_detection import (
+    boost_low_light,
     calibrate_step,
     calibration_done,
     detect_front_objects,
@@ -20,6 +21,7 @@ from image_detection import (
     detect_slope,
     infer_golden_lane_from_tokens,
 )
+from object_tracking import track_front, track_rear
 from perception_types import PerceptionResult
 
 
@@ -95,12 +97,23 @@ def run_perception(front_frame, back_frame) -> PerceptionResult:
     if not calibration_done():
         calibrate_step(front_frame)
 
-    front_per = detect_front_objects(front_frame)
-    lane_offset = detect_lane_offset(front_frame)
+    # Detect the low-light event on the ORIGINAL frame, then brighten the frame
+    # used for detection so HSV/lane detection survives the dark (Challenge 1;
+    # toggle in image_detection.LOW_LIGHT_BOOST_ENABLED). No-op in normal light.
     low_light = detect_low_brightness(front_frame)
+    detect_frame = boost_low_light(front_frame, low_light)
+
+    front_per = detect_front_objects(detect_frame)
+    lane_offset = detect_lane_offset(detect_frame)
     rear_per = detect_rear(back_frame) if back_frame is not None else None
 
-    curve_dbg = detect_lane_curve(front_frame)
+    # Multi-object tracking (toggle in object_tracking.TRACKING_ENABLED). Purely
+    # additive: enriches the orb / chasing-car dicts with stable track ids and
+    # velocity; a no-op when disabled.
+    front_per = track_front(front_per)
+    rear_per = track_rear(rear_per)
+
+    curve_dbg = detect_lane_curve(detect_frame)
     curve_bias = curve_dbg['curve_bias'] if curve_dbg else 0.0
 
     # Phase 17: Golden Lane. The banner is drawn on the main game view, not the

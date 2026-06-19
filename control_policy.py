@@ -10,6 +10,8 @@ from image_detection import (
     CENTER_BAND_FRAC,
     GREEN_ATTRACT_GAIN,
     GREEN_ATTRACT_MIN_AREA,
+    GREEN_COMMIT_DISTANCE,
+    GREEN_COMMIT_MAX_STEER,
     GREEN_LANE_CHANGE_BAND,
     GREEN_SEEK_GAIN,
     GREEN_SEEK_HOLD_S,
@@ -71,6 +73,20 @@ _lane_change_until = 0.0
 _lane_change_dir = 1
 
 
+def _near_green_commit(cx, distance, curve_bias):
+    """Once a green is within GREEN_COMMIT_DISTANCE, drive gently onto it instead
+    of starting a lane change. A near green's centroid offset magnifies as it
+    drops to the frame bottom and would otherwise cross GREEN_LANE_CHANGE_BAND
+    and swerve us off it just before contact (only a problem when slow). Returns
+    a clamped gentle steer, or None if the green is not near enough to commit."""
+    if distance is None or distance >= GREEN_COMMIT_DISTANCE:
+        return None
+    _green_seek['until'] = 0.0          # cancel any pending lane-change latch
+    _green_seek['dir'] = 0
+    steer = GREEN_ATTRACT_GAIN * cx + LANE_CURVE_GAIN * curve_bias
+    return float(np.clip(steer, -GREEN_COMMIT_MAX_STEER, GREEN_COMMIT_MAX_STEER))
+
+
 def _compute_steering(
     front_per: FrontPerception | None,
     curve_bias: float,
@@ -91,6 +107,13 @@ def _compute_steering(
     orbs = front_per.get('orbs', []) if front_per else []
     nearest = front_per.get('nearest') if front_per else None
     police = front_per.get('police') if front_per else None
+
+    # A green was just collected (object_tracking saw the token driven over and
+    # vanish). Drop the green-seek bridging latch so we don't keep steering at
+    # the now-empty lane — the logic below retargets the next green this frame.
+    if front_per and front_per.get('collected_green'):
+        _green_seek['until'] = 0.0
+        _green_seek['dir'] = 0
 
     # Police ahead: dodge if close/centred, otherwise grab a red token to escape.
     if police is not None:
@@ -141,6 +164,10 @@ def _compute_steering(
             return float(RED_AVOID_GAIN * direction)
         if target['color'] == 'yellow':
             return float(np.clip(-YELLOW_AVOID_GAIN * np.sign(cx or 1.0), -1, 1))
+        # Green: if it's nearly on us, commit to collecting (no late lane change).
+        committed = _near_green_commit(cx, target.get('distance'), curve_bias)
+        if committed is not None:
+            return committed
         if abs(cx) > GREEN_LANE_CHANGE_BAND:
             _green_seek['dir'] = 1 if cx > 0 else -1
             _green_seek['until'] = now + GREEN_SEEK_HOLD_S
@@ -159,6 +186,9 @@ def _compute_steering(
     # Fallback colour priority: green > red > yellow > straight.
     if green is not None and green['area_frac'] > GREEN_ATTRACT_MIN_AREA:
         cx = green['centroid_x_norm']
+        committed = _near_green_commit(cx, green.get('distance'), curve_bias)
+        if committed is not None:
+            return committed
         if abs(cx) > GREEN_LANE_CHANGE_BAND:
             _green_seek['dir'] = 1 if cx > 0 else -1
             _green_seek['until'] = now + GREEN_SEEK_HOLD_S

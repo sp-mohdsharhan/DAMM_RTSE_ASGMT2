@@ -1347,11 +1347,11 @@ def detect_low_brightness(frame):
 
     is_low = mean_v < LOW_BRIGHTNESS_THRESHOLD
 
-    print(
-        f"[LOW_BRIGHTNESS] Mean V={mean_v:.1f} "
-        f"Threshold={LOW_BRIGHTNESS_THRESHOLD} "
-        f"Detected={is_low}"
-    )
+    #print(
+    #    f"[LOW_BRIGHTNESS] Mean V={mean_v:.1f} "
+    #   f"Threshold={LOW_BRIGHTNESS_THRESHOLD} "
+    #    f"Detected={is_low}"
+    #)
 
     return is_low
 

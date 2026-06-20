@@ -144,8 +144,8 @@ class _Track:
         self.collected_emitted = False
 
     def predict(self):
-        p = self.kf.predict()
-        self.pred = (float(p[0]), float(p[1]))
+        p = self.kf.predict()                       # (4, 1) column vector
+        self.pred = (float(p[0, 0]), float(p[1, 0]))
         return self.pred
 
     def update(self, x, y):
@@ -170,8 +170,10 @@ class _Track:
 
     @property
     def velocity(self):
+        # statePost is a (4, 1) column vector; index [row, 0] for a true scalar
+        # (NumPy 2.0 rejects float() on a 1-element non-0-d array).
         s = self.kf.statePost
-        return float(s[2]), float(s[3])
+        return float(s[2, 0]), float(s[3, 0])
 
 
 class MultiObjectTracker:

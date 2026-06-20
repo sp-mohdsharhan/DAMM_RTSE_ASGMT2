@@ -304,7 +304,23 @@ def send_controls_task():
 # ---------------------------------------------------------
 # Main (Scheduler Initialization)
 # ---------------------------------------------------------
+def _set_dpi_awareness():
+    """Make the process DPI-aware so OpenCV HighGUI windows are not scaled/clipped
+    on displays with Windows scaling (125%/150%). Without this, AUTOSIZE windows
+    render at 1:1 device pixels and get cropped on high-DPI screens. Best-effort:
+    tries per-monitor-v2 -> per-monitor -> system, and is a no-op off Windows."""
+    try:
+        # PROCESS_PER_MONITOR_DPI_AWARE = 2 (Win 8.1+)
+        ctypes.windll.shcore.SetProcessDpiAwareness(2)
+    except Exception:
+        try:
+            ctypes.windll.user32.SetProcessDPIAware()   # system-DPI aware (older)
+        except Exception:
+            pass
+
+
 if __name__ == '__main__':
+    _set_dpi_awareness()
     print("Initializing RTSE Sample Drive...")
 
     # Initialize network connections

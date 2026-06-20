@@ -10,7 +10,9 @@ from image_detection import (
     CENTER_BAND_FRAC,
     GREEN_ATTRACT_GAIN,
     GREEN_ATTRACT_MIN_AREA,
+    GREEN_COMMIT_BAND,
     GREEN_COMMIT_DISTANCE,
+    GREEN_COMMIT_LOCK_S,
     GREEN_COMMIT_MAX_STEER,
     GREEN_LANE_CHANGE_BAND,
     GREEN_SEEK_GAIN,
@@ -68,6 +70,11 @@ _red_avoid = {'until': 0.0, 'settle_until': 0.0, 'dir': 0}
 # mid-crossing so the lane change still completes.
 _green_seek = {'until': 0.0, 'dir': 0}
 
+# Green collect-commit lock: once an in-path green is close, commit to driving
+# onto it for GREEN_COMMIT_LOCK_S seconds so a slow approach (magnifying offset /
+# flicker) can't swerve us off it. Released early on a collect.
+_green_commit = {'until': 0.0}
+
 # Green target lock (anti-weave): pursue ONE green — identified by its tracker
 # track_id — until it is collected or leaves view, instead of re-picking the
 # nearest green every frame. Two greens at similar distance otherwise make the
@@ -103,22 +110,29 @@ def _locked_green(orbs, fallback):
     return chosen
 
 
-def _near_green_commit(cx, distance):
-    """Once a green is within GREEN_COMMIT_DISTANCE, drive gently onto it instead
-    of starting a lane change. A near green's centroid offset magnifies as it
-    drops to the frame bottom and would otherwise cross GREEN_LANE_CHANGE_BAND
-    and swerve us off it just before contact (only a problem when slow). Returns
-    a clamped gentle steer, or None if the green is not near enough to commit.
+def _commit_to_green(now, cx, distance):
+    """Decide whether we are committed to driving onto a green right now.
 
-    Steers purely on the green's offset — the lane-curve bias is deliberately
-    excluded here: at this range curve_bias (up to LANE_CURVE_GAIN) would saturate
-    the small commit clamp and pull us off a centered token on bends."""
-    if distance is None or distance >= GREEN_COMMIT_DISTANCE:
-        return None
-    _green_seek['until'] = 0.0          # cancel any pending lane-change latch
-    _green_seek['dir'] = 0
-    steer = GREEN_ATTRACT_GAIN * cx
-    return float(np.clip(steer, -GREEN_COMMIT_MAX_STEER, GREEN_COMMIT_MAX_STEER))
+    Arms (and refreshes) a GREEN_COMMIT_LOCK_S-second lock whenever an in-path
+    green (|cx| < GREEN_COMMIT_BAND) is within GREEN_COMMIT_DISTANCE. Once armed
+    the lock holds for the full second even as the token's offset magnifies near
+    the frame bottom or its detection flickers — so a slow car can't swerve off
+    it just before contact. Returns True while the lock is active."""
+    if (distance is not None
+            and distance < GREEN_COMMIT_DISTANCE
+            and abs(cx) < GREEN_COMMIT_BAND):
+        _green_commit['until'] = now + GREEN_COMMIT_LOCK_S
+        _green_seek['until'] = 0.0          # cancel any pending lane-change swerve
+        _green_seek['dir'] = 0
+    return now < _green_commit['until']
+
+
+def _green_commit_steer(cx):
+    """Gentle clamped steer that drives onto the committed green. Steers purely on
+    the green's offset — the lane-curve bias is deliberately excluded so a bend
+    can't saturate the small clamp and pull us off a centered token."""
+    return float(np.clip(GREEN_ATTRACT_GAIN * cx,
+                         -GREEN_COMMIT_MAX_STEER, GREEN_COMMIT_MAX_STEER))
 
 
 def _compute_steering(
@@ -150,6 +164,7 @@ def _compute_steering(
         _green_seek['until'] = 0.0
         _green_seek['dir'] = 0
         _green_lock['id'] = None
+        _green_commit['until'] = 0.0        # release the commit-lock; retarget next green
 
     # Police ahead: dodge if close/centred, otherwise grab a red token to escape.
     if police is not None:
@@ -203,10 +218,9 @@ def _compute_steering(
         # Green: hold one locked green (anti-weave) instead of the bare nearest.
         green_t = _locked_green(orbs, target)
         cx = green_t['centroid_x_norm']
-        # If it's nearly on us, commit to collecting (no late lane change).
-        committed = _near_green_commit(cx, green_t.get('distance'))
-        if committed is not None:
-            return committed
+        # Commit-lock: once it's in our path and close, drive onto it (no swerve).
+        if _commit_to_green(now, cx, green_t.get('distance')):
+            return _green_commit_steer(cx)
         if abs(cx) > GREEN_LANE_CHANGE_BAND:
             _green_seek['dir'] = 1 if cx > 0 else -1
             _green_seek['until'] = now + GREEN_SEEK_HOLD_S
@@ -226,9 +240,8 @@ def _compute_steering(
     if green is not None and green['area_frac'] > GREEN_ATTRACT_MIN_AREA:
         green = _locked_green(orbs, green)      # anti-weave: hold one green
         cx = green['centroid_x_norm']
-        committed = _near_green_commit(cx, green.get('distance'))
-        if committed is not None:
-            return committed
+        if _commit_to_green(now, cx, green.get('distance')):
+            return _green_commit_steer(cx)
         if abs(cx) > GREEN_LANE_CHANGE_BAND:
             _green_seek['dir'] = 1 if cx > 0 else -1
             _green_seek['until'] = now + GREEN_SEEK_HOLD_S
@@ -243,6 +256,12 @@ def _compute_steering(
             -1.0,
             1.0,
         ))
+
+    # Commit-lock still active but the green isn't detected this frame (flicker /
+    # just slid under the bumper): hold near-straight to finish driving onto it
+    # rather than swerving. Near hazards already pre-empted via the imminence block.
+    if now < _green_commit['until']:
+        return _green_commit_steer(0.0)
 
     if now < _green_seek['until']:
         return float(GREEN_SEEK_GAIN * _green_seek['dir'])

@@ -140,14 +140,19 @@ GREEN_ATTRACT_MIN_AREA = 0.004           # act on greens a touch earlier (commit
 GREEN_LANE_CHANGE_BAND = 0.92            # |centroid_x_norm| above this => green is in another lane -> commit
 GREEN_SEEK_GAIN = 1.0                    # committed steer magnitude toward an off-lane green
 GREEN_SEEK_HOLD_S = 1.0                  # bridge frames where green flickers / leaves ROI mid-cross
-# Near-green collect commit: once a green is THIS close (bird's-eye distance,
-# smaller = nearer) we stop initiating lane changes toward it. A near green's
-# centroid_x_norm magnifies as it drops to the frame bottom, which would
-# otherwise cross GREEN_LANE_CHANGE_BAND and swerve us off it right before
-# contact — fine when fast (we pass through first), but a slow car misses it. So
-# when this near we hold a gentle correction and just drive onto it. Red/yellow
-# are unaffected (their late swerve is the desired avoidance).
-GREEN_COMMIT_DISTANCE = 45.0            # within this -> commit to collecting, no lane change
+# Near-green collect commit (with a time lock). Once a green sits in our path and
+# within GREEN_COMMIT_DISTANCE we COMMIT to collecting it: drive gently onto it
+# and stop initiating lane changes. A near green's centroid_x_norm magnifies as
+# it drops to the frame bottom, which would otherwise cross GREEN_LANE_CHANGE_BAND
+# and swerve us off it right before contact — fine when fast (we pass through
+# first), but a slow car spends many frames there and swerves away. So the commit
+# LATCHES for GREEN_COMMIT_LOCK_S seconds: once armed, the magnifying offset (or a
+# brief detection flicker) can't break us off the token. Red/yellow are
+# unaffected (their late swerve is the desired avoidance), and a collected-green
+# event releases the lock so we retarget immediately.
+GREEN_COMMIT_DISTANCE = 80.0           # arm the commit when an in-path green is within this (smaller = nearer)
+GREEN_COMMIT_BAND = 0.92               # don't arm if the green is clearly in another lane (|cx| above this)
+GREEN_COMMIT_LOCK_S = 1.0              # hold the commit this long after last seeing it in front
 GREEN_COMMIT_MAX_STEER = 0.30          # clamp the gentle steer while committed
 # (Keep-LEFT / keep-RIGHT home-lane bias removed — the car now centres in the
 #  lane and reacts to orbs. See plan.md Phase 5 to restore a home-lane hug.)

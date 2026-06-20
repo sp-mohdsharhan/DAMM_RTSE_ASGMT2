@@ -13,7 +13,7 @@ PUBLIC SURFACE (everything below is consumed by sample_drive.py):
     LANE_CHANGE_DURATION_S, LANE_CHANGE_STEER,
     GREEN_ATTRACT_GAIN, GREEN_ATTRACT_MIN_AREA,
     GREEN_LANE_CHANGE_BAND, GREEN_SEEK_GAIN, GREEN_SEEK_HOLD_S,
-    RED_AVOID_GAIN, YELLOW_AVOID_GAIN, LANE_GAIN,
+    RED_AVOID_GAIN, YELLOW_AVOID_GAIN,
     LANE_CURVE_GAIN, HILL_AREA_SCALE,
     LOW_BRIGHTNESS_THRESHOLD,
 - Functions:
@@ -124,7 +124,7 @@ ORB_TIE_MARGIN = 25.0                     # if a red/yellow is ~this close to th
 # live here — the game itself owns those rules; we just react to what we see.
 RED_AVOID_AREA_FRAC = 0.010              # detect red even further away (commit lane change early)
 RED_AVOID_BAND_FRAC = 0.70               # wider than CENTER_BAND_FRAC: any red roughly ahead triggers lane change
-RED_LANE_CHANGE_DURATION_S = 1.6         # matches LANE_CHANGE_DURATION_S — guaranteed full lane cross
+RED_LANE_CHANGE_DURATION_S = 1.6         # red dodge swerve hold — long enough for a full lane cross
 RED_SETTLE_DURATION_S = 0.35             # brief counter-steer to straighten out after the swerve
 YELLOW_AVOID_AREA_FRAC = 0.02            # bbox/ROI area to trigger yellow avoidance
 CENTER_BAND_FRAC = 0.55                  # |x_norm| < this counts as "in path"
@@ -153,7 +153,6 @@ GREEN_COMMIT_MAX_STEER = 0.30          # clamp the gentle steer while committed
 #  lane and reacts to orbs. See plan.md Phase 5 to restore a home-lane hug.)
 RED_AVOID_GAIN = 0.8                     # full-lock swerve when red is in path
 YELLOW_AVOID_GAIN = 0.7
-LANE_GAIN = 0.6
 
 # Lane-curve steering bias: how strongly the anticipated bend from
 # detect_lane_curve() biases steering on top of the instantaneous lane offset.

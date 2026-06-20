@@ -68,22 +68,56 @@ _red_avoid = {'until': 0.0, 'settle_until': 0.0, 'dir': 0}
 # mid-crossing so the lane change still completes.
 _green_seek = {'until': 0.0, 'dir': 0}
 
+# Green target lock (anti-weave): pursue ONE green — identified by its tracker
+# track_id — until it is collected or leaves view, instead of re-picking the
+# nearest green every frame. Two greens at similar distance otherwise make the
+# car flip-flop and collect neither. Needs object_tracking enabled (track ids);
+# with tracking off it transparently falls back to nearest-green each frame.
+_green_lock = {'id': None}
+
 # Chasing-car forced-swerve latch. Direction alternates each trigger.
 _lane_change_until = 0.0
 _lane_change_dir = 1
 
 
-def _near_green_commit(cx, distance, curve_bias):
+def _locked_green(orbs, fallback):
+    """Anti-weave green selection. Returns the green to pursue this frame.
+
+    Holds the previously-locked green (matched by tracker track_id) as long as it
+    is still visible, so the car doesn't flip-flop between two similar-distance
+    greens. When the locked green is gone (collected / left view) it locks onto
+    the nearest visible green. With tracking off (track_id is None) it degrades to
+    nearest-green each frame, i.e. the original behaviour. `fallback` is returned
+    when no green is visible."""
+    greens = [o for o in orbs if o.get('color') == 'green']
+    if not greens:
+        _green_lock['id'] = None
+        return fallback
+    locked_id = _green_lock['id']
+    if locked_id is not None:
+        for o in greens:
+            if o.get('track_id') == locked_id:
+                return o                      # keep pursuing the same green
+    chosen = min(greens, key=lambda o: o['distance'])
+    _green_lock['id'] = chosen.get('track_id')
+    return chosen
+
+
+def _near_green_commit(cx, distance):
     """Once a green is within GREEN_COMMIT_DISTANCE, drive gently onto it instead
     of starting a lane change. A near green's centroid offset magnifies as it
     drops to the frame bottom and would otherwise cross GREEN_LANE_CHANGE_BAND
     and swerve us off it just before contact (only a problem when slow). Returns
-    a clamped gentle steer, or None if the green is not near enough to commit."""
+    a clamped gentle steer, or None if the green is not near enough to commit.
+
+    Steers purely on the green's offset — the lane-curve bias is deliberately
+    excluded here: at this range curve_bias (up to LANE_CURVE_GAIN) would saturate
+    the small commit clamp and pull us off a centered token on bends."""
     if distance is None or distance >= GREEN_COMMIT_DISTANCE:
         return None
     _green_seek['until'] = 0.0          # cancel any pending lane-change latch
     _green_seek['dir'] = 0
-    steer = GREEN_ATTRACT_GAIN * cx + LANE_CURVE_GAIN * curve_bias
+    steer = GREEN_ATTRACT_GAIN * cx
     return float(np.clip(steer, -GREEN_COMMIT_MAX_STEER, GREEN_COMMIT_MAX_STEER))
 
 
@@ -109,11 +143,13 @@ def _compute_steering(
     police = front_per.get('police') if front_per else None
 
     # A green was just collected (object_tracking saw the token driven over and
-    # vanish). Drop the green-seek bridging latch so we don't keep steering at
-    # the now-empty lane — the logic below retargets the next green this frame.
+    # vanish). Drop the green-seek bridging latch and the target lock so we
+    # retarget the next green cleanly this frame instead of steering at the now-
+    # empty lane.
     if front_per and front_per.get('collected_green'):
         _green_seek['until'] = 0.0
         _green_seek['dir'] = 0
+        _green_lock['id'] = None
 
     # Police ahead: dodge if close/centred, otherwise grab a red token to escape.
     if police is not None:
@@ -164,8 +200,11 @@ def _compute_steering(
             return float(RED_AVOID_GAIN * direction)
         if target['color'] == 'yellow':
             return float(np.clip(-YELLOW_AVOID_GAIN * np.sign(cx or 1.0), -1, 1))
-        # Green: if it's nearly on us, commit to collecting (no late lane change).
-        committed = _near_green_commit(cx, target.get('distance'), curve_bias)
+        # Green: hold one locked green (anti-weave) instead of the bare nearest.
+        green_t = _locked_green(orbs, target)
+        cx = green_t['centroid_x_norm']
+        # If it's nearly on us, commit to collecting (no late lane change).
+        committed = _near_green_commit(cx, green_t.get('distance'))
         if committed is not None:
             return committed
         if abs(cx) > GREEN_LANE_CHANGE_BAND:
@@ -185,8 +224,9 @@ def _compute_steering(
 
     # Fallback colour priority: green > red > yellow > straight.
     if green is not None and green['area_frac'] > GREEN_ATTRACT_MIN_AREA:
+        green = _locked_green(orbs, green)      # anti-weave: hold one green
         cx = green['centroid_x_norm']
-        committed = _near_green_commit(cx, green.get('distance'), curve_bias)
+        committed = _near_green_commit(cx, green.get('distance'))
         if committed is not None:
             return committed
         if abs(cx) > GREEN_LANE_CHANGE_BAND:

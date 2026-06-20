@@ -36,7 +36,7 @@ from image_detection import (
 from perception_types import FrontPerception, RearPerception, TacticalSnapshot
 
 
-CRUISE_THROTTLE = 0.8
+CRUISE_THROTTLE = 1.0
 LOW_BRIGHTNESS_THROTTLE = -1.0
 
 # Golden Lane (Phase 17): aggressive steering gain used to snap the car onto a

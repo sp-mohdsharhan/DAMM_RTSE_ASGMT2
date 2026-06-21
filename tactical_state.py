@@ -28,6 +28,27 @@ _state = {
 _red_was_collectable = False
 
 
+def reset_tactical_state() -> None:
+    """Clear all tactical bookkeeping so the next run starts fresh.
+
+    Useful when restarting a trial in the same process: without this the run
+    timer, police latch, and red-hit counter carry over from the previous run.
+    """
+    global _red_was_collectable
+
+    _state.update({
+        'run_start_time': None,
+        'elapsed_game_s': 0.0,
+        'police_active': False,
+        'police_started_at': None,
+        'police_deadline': None,
+        'passed_police': False,
+        'police_timeout': False,
+        'red_hits': 0,
+    })
+    _red_was_collectable = False
+
+
 def is_red_collectable(front_per: FrontPerception | None) -> bool:
     """True when a red token is close enough to count as collected/passed.
 

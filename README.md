@@ -251,3 +251,17 @@ Our implementation lives in the editable regions and supporting modules:
 
 - **Golden Lane countdown is not read; the lock is a fixed 5 s.** `detect_golden_lane()` reads the lane number from the banner, but the `(Xs)` countdown OCR is unreliable, so the controller cannot know the true remaining time. It instead holds the lane for a fixed `GOLDEN_LANE_LOCK_S = 5.0 s` anchored to the first detection. Because detection can lag the real event start, the lock may end slightly before or after the game's actual window. A future main-window OCR path could supply the true deadline.
 - **Token-inference fallback can be blocked by yellow-token debuffs.** If the banner lane digit is unread and the car hits a yellow token before/during Golden Lane, the game can apply a negative camera effect where tokens disappear or appear white/unknown. During that window the front camera may lack green-token evidence for `infer_golden_lane_from_tokens()`, so the fallback trigger can be delayed or missed. Once any lane is latched, though, the 5 s lock holds the manoeuvre through such flicker.
+
+---
+
+## Project Status
+
+**Completed - Semester II, 2025/2026.**
+
+This marks the final state of the DAMM SpeedTrials2D autonomous driver for SECJ 4423 Group Assignment 2. All four real-time requirements - concurrency, fixed task periods, deadline-monotonic priorities, and split-lock synchronisation - are implemented and integrated, and the camera-reactive perception and steering stack handles the green, red, yellow, chasing-car, police, Golden Lane, hill, and low-light scenarios documented above.
+
+From a rule-based HSV pipeline to bird's-eye lane gridding and latched manoeuvres, the controller grew through many tuning iterations into a deterministic, lightweight driver that runs near 30 Hz. The known limitations are documented honestly above rather than hidden - they map out where a future iteration would go next.
+
+Thanks to the team for the late-night tuning sessions and to Prof. Ts. Dr. Dayang Norhayati Bte. Abang Jawawi for the guidance throughout the course.
+
+> *"The Unity simulator stays authoritative; we just taught the camera to drive."* - Team DAMM

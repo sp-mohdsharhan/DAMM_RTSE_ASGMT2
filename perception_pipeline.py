@@ -25,7 +25,11 @@ from object_tracking import track_front, track_rear
 from perception_types import PerceptionResult
 
 
-LANE_GRID_LOG_ENABLED = True
+# Lane-grid logging defaults to on, but can be disabled without a code edit by
+# setting LANE_GRID_LOG=0 (or false/no/off) in the environment before launch.
+LANE_GRID_LOG_ENABLED = os.environ.get('LANE_GRID_LOG', '1').lower() not in (
+    '0', 'false', 'no', 'off',
+)
 LANE_GRID_LOG_INTERVAL_S = 0.5
 LANE_GRID_LOG_PATH = os.path.join('logs', 'lane_grid.log')
 _lane_grid_log_state = {'last_at': 0.0, 'init': False}
